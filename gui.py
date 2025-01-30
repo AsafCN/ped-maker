@@ -358,11 +358,15 @@ class CategoryView(ctk.CTkFrame):
         frame = ctk.CTkFrame(self.scrollable_frame)
         frame.pack(fill='x', padx=5, pady=5)
         
-        # Left side: Item checkbox and image
+        # Left side: Item checkbox and preview image
         left_frame = ctk.CTkFrame(frame)
         left_frame.pack(side='left', padx=5)
         
         var = ctk.BooleanVar()
+        # Set initial checkbox state based on saved selection
+        if item_name in self.update_callback(self.category, None, None):  # Get current selections
+            var.set(True)
+            
         checkbox = ctk.CTkCheckBox(
             left_frame,
             text=f"Item {item_name}",
@@ -373,42 +377,82 @@ class CategoryView(ctk.CTkFrame):
         )
         checkbox.pack(side='left', padx=5)
         
-        # Texture display area (for selected textures)
-        textures_display = ctk.CTkFrame(left_frame)
-        textures_display.pack(side='left', padx=5)
+        # Preview image on the left
+        preview_label = ctk.CTkLabel(left_frame, width=100, height=100, text="")
+        preview_label.pack(side='left', padx=5)
         
-        # Textures dropdown
+        # Load preview image
+        preview_image = self.get_preview_image(item_path)
+        if preview_image:
+            self.image_loader.load_image(
+                preview_image,
+                (100, 100),
+                lambda photo: preview_label.configure(image=photo, text="")
+            )
+
+        # Right side: Texture selection
+        right_frame = ctk.CTkFrame(frame,width=100, height=100)
+        right_frame.pack(side='right', fill='x', expand=True, padx=5)
+        
         textures_path = os.path.join(item_path, "textures", "pics")
         if os.path.exists(textures_path):
-            texture_label = ctk.CTkLabel(left_frame, text="Texture:", font=ctk.CTkFont(family="Supernova", size=13))
+            # Create horizontal container for "Texture:" label, selected textures, and dropdown
+            texture_container = ctk.CTkFrame(right_frame)
+            texture_container.pack(side='left', fill='x', expand=True)
+            
+            texture_label = ctk.CTkLabel(texture_container, text="Texture:", font=ctk.CTkFont(family="Supernova", size=13))
             texture_label.pack(side='left', padx=5)
             
-            # Store references for updating
-            self.texture_displays[item_name] = textures_display
+            # Container for selected textures
+            selected_textures_frame = ctk.CTkFrame(texture_container,width=100, height=100)
+            selected_textures_frame.pack(side='left', fill='x', expand=True, padx=5)
+            self.texture_displays[item_name] = selected_textures_frame
             
+            # Get current textures from state and display them
+            texture_category = f"{self.category}_textures"
+            current_textures = self.update_callback(texture_category, item_name, None)
+            if current_textures and item_name in current_textures:
+                if isinstance(current_textures[item_name], str):
+                    # Convert single texture to list for backward compatibility
+                    current_textures[item_name] = [current_textures[item_name]]
+                self.item_textures[item_name] = current_textures[item_name]
+                self.update_texture_display(item_name)
+            
+            # Add dropdown next to the texture label
             dropdown = ImageDropdown(
-                left_frame,
+                texture_container,
                 images_path=textures_path,
-                current_value=None,
                 image_loader=self.image_loader,
                 command=lambda t: self.add_texture(item_name, t)
             )
             dropdown.pack(side='left', padx=5)
 
+    def update_preview_image(self, label, photo, item_name):
+        """Update the preview image, considering current texture state"""
+        if item_name in self.item_textures and self.item_textures[item_name]:
+            # Don't update if there's a texture selected
+            return
+        if photo:
+            label.configure(image=photo, text="")
+
     def add_texture(self, item_name: str, texture: str):
         """Add a new texture to the item"""
-        if not hasattr(self, 'item_textures'):
-            self.item_textures = {}
+        texture_category = f"{self.category}_textures"
         
-        if item_name not in self.item_textures:
-            self.item_textures[item_name] = []
-        
-        if texture and texture not in self.item_textures[item_name]:
-            self.item_textures[item_name].append(texture)
-            self.update_texture_display(item_name)
-            
-            # Update the selection state
-            self.update_callback(f"{self.category}_textures", item_name, self.item_textures[item_name])  
+        if texture:
+            # Initialize item_textures if needed
+            if not hasattr(self, 'item_textures'):
+                self.item_textures = {}
+            if item_name not in self.item_textures:
+                self.item_textures[item_name] = []
+                
+            # Add new texture if not already present
+            if texture not in self.item_textures[item_name]:
+                self.item_textures[item_name].append(texture)
+                self.update_texture_display(item_name)
+                
+                # Update the selection state with all textures
+                self.update_callback(texture_category, item_name, self.item_textures[item_name])
 
     def update_texture_display(self, item_name: str):
         """Update the display of selected textures"""
@@ -420,25 +464,28 @@ class CategoryView(ctk.CTkFrame):
                 widget.destroy()
                 
             # Show all selected textures
-            if item_name in self.item_textures:
+            if item_name in self.item_textures and self.item_textures[item_name]:
+                # Calculate size based on number of textures
+                size = min(35, 100 // len(self.item_textures[item_name]))
+                
                 for texture in self.item_textures[item_name]:
                     image_path = os.path.join(self.base_path, self.category, item_name, "textures", "pics", texture)
                     
                     # Create frame for each texture
                     texture_frame = ctk.CTkFrame(display_frame)
-                    texture_frame.pack(side='left', padx=2)
+                    texture_frame.pack(side='left', padx=1)
                     
                     # Add texture image
-                    texture_label = ctk.CTkLabel(texture_frame, width=40, height=40, text="")
-                    texture_label.pack(padx=2, pady=2)
+                    texture_label = ctk.CTkLabel(texture_frame, width=size, height=size, text="")
+                    texture_label.pack(padx=1, pady=1)
                     
                     # Add click handler to remove
-                    texture_label.bind("<Button-1>", lambda e, t=texture, i=item_name: self.remove_texture(i, t, e))
+                    texture_label.bind("<Button-1>", lambda e, t=texture, i=item_name: self.remove_texture(i, t))
                     
                     # Load the image
                     self.image_loader.load_image(
                         image_path,
-                        (40, 40),
+                        (size, size),
                         lambda photo, label=texture_label: label.configure(image=photo) if photo else None
                     )
 
@@ -798,18 +845,24 @@ class PedCreatorGUI(ctk.CTk):
             if item_name in self.updated_dictionary[texture_category]:
                 del self.updated_dictionary[texture_category][item_name]
 
-    def update_selection(self, category: str, item_name: str, selected: bool):
+
+    def update_selection(self, category: str, item_name: str, selected):
         """Update the selection in the dictionary"""
+        if item_name is None and selected is None:
+            # Return current selections for the category
+            return self.updated_dictionary.get(category, [] if not category.endswith('_textures') else {})
+            
         if category.endswith("_textures"):
-            # Handle texture categories (lists of textures per item)
-            if not selected:
+            if selected is None:
                 # Remove textures for this item
                 if item_name in self.updated_dictionary[category]:
                     del self.updated_dictionary[category][item_name]
             else:
-                # Initialize empty list if needed
-                if item_name not in self.updated_dictionary[category]:
-                    self.updated_dictionary[category][item_name] = []
+                # Initialize texture dictionary if needed
+                if category not in self.updated_dictionary:
+                    self.updated_dictionary[category] = {}
+                # Update textures
+                self.updated_dictionary[category][item_name] = selected.copy() if isinstance(selected, list) else selected
         else:
             # Handle regular categories (lists)
             if selected and item_name not in self.updated_dictionary[category]:
@@ -821,7 +874,9 @@ class PedCreatorGUI(ctk.CTk):
                 texture_category = f"{category}_textures"
                 if texture_category in self.updated_dictionary and item_name in self.updated_dictionary[texture_category]:
                     del self.updated_dictionary[texture_category][item_name]
-
+        
+        return self.updated_dictionary.get(category, [] if not category.endswith('_textures') else {})
+    
     def on_selection_window_close(self, option_name: str):
         """Properly handle window close and maintain selections"""
         if option_name in self.selection_windows:
