@@ -2,7 +2,7 @@ import customtkinter as ctk
 from config import *
 from PIL import Image
 import os
-import sys
+import time
 from typing import Dict, List, Optional
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -12,14 +12,16 @@ import queue
 from functools import partial
 
 class ImageDropdown(ctk.CTkFrame):
-    def __init__(self, master, **kwargs):
-        self.images_path = kwargs.pop('images_path', None)
-        self.current_value = kwargs.pop('current_value', None)
-        self.image_loader = kwargs.pop('image_loader', None)
-        self.command = kwargs.pop('command', None)
-        self.preview_label = kwargs.pop('preview_label', None)
+    def __init__(self, master, images_path, current_value, image_loader, command, preview_label, selected_textures):
+        self.images_path = images_path
+        self.current_value = current_value
+        self.command = command
+        self.preview_label = preview_label
+        self.selected_textures = selected_textures
 
-        super().__init__(master, **kwargs)
+        super().__init__(master)
+
+        self.image_loader = AsyncImageLoader(parent=self)
 
         self.button = ctk.CTkButton(
             self,
@@ -39,15 +41,87 @@ class ImageDropdown(ctk.CTkFrame):
             self.set_button_image(self.current_value)
                 
     def show_popup(self):
-        """Show the dropdown popup"""
+        """Guaranteed functional popup creation"""
         try:
-            if self.popup:
+            # Completely destroy previous popup
+            if self.popup and self.popup.winfo_exists():
                 self.popup.destroy()
-            self.create_popup()
+                self.popup = None
+
+            # Create fresh popup structure
+            self.popup = ctk.CTkToplevel(self)
+            self.popup.withdraw()
+            self.popup.overrideredirect(True)
+            self.popup.attributes("-topmost", True)
+            
+            # Container with direct parent reference
+            container = ctk.CTkFrame(self.popup)
+            container.pack(expand=True, fill='both')
+            
+            # New scroll frame instance
+            self.scroll_frame = ctk.CTkScrollableFrame(
+                container,
+                width=150,
+                height=200
+            )
+            self.scroll_frame.pack(expand=True, fill='both')
+
+            # Load textures with PROPER command binding
+            textures = self._get_available_textures()[:10]
+            for idx, texture in enumerate(textures):
+                # Create button with explicit command capture
+                btn = ctk.CTkButton(
+                    self.scroll_frame,
+                    text="",
+                    width=140,
+                    height=40,
+                    fg_color=PURPLE,
+                    hover_color=HOVER_PURPLE,
+                    command=lambda t=texture: self._handle_texture_selection(t)  # Fixed binding
+                )
+                btn.pack(padx=5, pady=2)
+                
+                # Load image with safety checks
+                image_path = os.path.join(self.images_path, texture)
+                if os.path.exists(image_path):
+                    self.image_loader.load_image(
+                        image_path,
+                        (100, 100),
+                        lambda photo, b=btn: self._safe_update_button(b, photo)
+                    )
+
+            # Finalize popup
             self.place_popup()
             self.popup.deiconify()
+            
         except Exception as e:
-            logger.error(f"Error showing popup: {e}")
+            logger.error(f"Popup rebuild failed: {str(e)}")
+
+    def _handle_texture_selection(self, texture):
+        """Direct selection handling with UI update"""
+        try:
+            if texture not in self.selected_textures:
+                self.selected_textures.append(texture)
+                self.set_button_image(texture)
+                if self.command:
+                    self.command(texture)
+            if self.popup:
+                self.popup.destroy()
+                self.popup = None
+        except Exception as e:
+            logger.error(f"Selection failed: {str(e)}")
+
+    def _safe_update_button(self, button, photo):
+        """Thread-safe button update"""
+        if button.winfo_exists():
+            button.configure(image=photo, text="")
+
+    def _get_available_textures(self):  # NEW METHOD
+        """Get updated list of textures excluding selected ones"""
+        all_textures = sorted([t for t in os.listdir(self.images_path) 
+                            if t.endswith('.png')])
+        return [t for t in all_textures 
+            if t not in self.selected_textures]
         
     def place_popup(self):
         """Position the popup below the button"""
@@ -62,70 +136,72 @@ class ImageDropdown(ctk.CTkFrame):
         self.popup.geometry(f"+{x}+{y}")
         
     def create_popup(self):
-        """Create the popup window for the dropdown"""
-        # logger.debug("Creating popup for ImageDropdown")
-
-        if self.popup:
-            return
-            
-        self.popup = ctk.CTkToplevel(self)
-        self.popup.withdraw()
-        self.popup.overrideredirect(True)
-        self.popup.attributes("-topmost", True)
-        
-        container = ctk.CTkFrame(self.popup)
-        container.pack(expand=True, fill='both')
-        
-        scroll_frame = ctk.CTkScrollableFrame(
-            container,
-            width=150,
-            height=200
-        )
-        scroll_frame.pack(expand=True, fill='both')
-        
+        """Recreate popup with proper initialization"""
         try:
-            # Get list of texture files
-            textures = sorted([t for t in os.listdir(self.images_path) if t.endswith('.png')])
+            # Destroy existing popup completely
+            if self.popup and self.popup.winfo_exists():
+                self.popup.destroy()
             
-            # Load textures in batches for better performance
-            self.load_textures_batch(scroll_frame, textures[:10])
+            # Create fresh popup structure
+            self.popup = ctk.CTkToplevel(self)
+            self.popup.withdraw()
+            self.popup.overrideredirect(True)
+            self.popup.attributes("-topmost", True)
             
-            if len(textures) > 10:
-                self.remaining_textures = textures[10:]
-                scroll_frame.bind('<Configure>', self.load_more_textures)
+            # Container with proper parent reference
+            container = ctk.CTkFrame(self.popup)
+            container.pack(expand=True, fill='both')
+            
+            # Reinitialize scroll frame with correct parent
+            self.scroll_frame = ctk.CTkScrollableFrame(
+                container,
+                width=150,
+                height=200
+            )
+            self.scroll_frame.pack(expand=True, fill='both')
+            
+            # Load textures with current selection state
+            available_textures = self._get_available_textures()
+            self.load_textures_batch(self.scroll_frame, available_textures[:10])  # Initial load
+            
+            # Mouse tracking
+            for widget in (self.popup, container, self.scroll_frame):
+                widget.bind('<Enter>', self.cancel_close)
+                widget.bind('<Leave>', lambda e: self.schedule_close())
                 
         except Exception as e:
-            # logger.error("Error loading textures: %s", e)
-            PedCreatorGUI.create_message_box("Error", "Error loading textures: {str(e)}")
-            error_label = ctk.CTkLabel(scroll_frame, text=f"Error loading textures: {str(e)}")
-            error_label.pack(padx=5, pady=2)
-        
-        # Mouse tracking
-        for widget in (self.popup, container, scroll_frame):
-            widget.bind('<Enter>', self.cancel_close)
-            widget.bind('<Leave>', lambda e: self.schedule_close())
+            logger.error(f"Popup creation failed: {str(e)}")
             
     def set_button_image(self, texture):
-        """Set the button image to the specified texture."""
         try:
-            image_path = os.path.join(self.images_path, texture)
-            if os.path.exists(image_path):
+            if texture:
+                image_path = os.path.join(self.images_path, texture)
                 image = Image.open(image_path)
-                image.thumbnail((140, 35))
-                photo = ctk.CTkImage(image, size=(140, 35))
-                self.button.configure(image=photo, text="")
                 
+                # Use high-quality resizing
+                image = image.resize((140, 35), Image.Resampling.LANCZOS)  # Fixed size
+                photo = ctk.CTkImage(image, size=(140, 35))
+                
+                # Show BOTH image and text
+                self.button.configure(image=photo, text="Selected Texture")
+                
+                # Update preview label with high-quality image
                 if self.preview_label:
-                    preview_photo = ctk.CTkImage(image, size=(100, 100))
+                    preview_image = Image.open(image_path)
+                    preview_image = preview_image.resize((100, 100), Image.Resampling.LANCZOS)  # Fixed size
+                    preview_photo = ctk.CTkImage(preview_image, size=(100, 100))
                     self.preview_label.configure(image=preview_photo, text="")
             else:
-                self.button.configure(text="No Image")
+                self.button.configure(image=None, text="Select Texture")
         except Exception as e:
-            logger.error(f"Error loading image: {e}")
-            self.button.configure(text="Error")    
+            logger.error(f"Image error: {e}")
+            self.button.configure(image=None, text="Select Texture")
 
     def load_textures_batch(self, parent, textures):
         """Load a batch of textures asynchronously."""
+        if not parent.winfo_exists():
+            return
+        
         for texture in textures:
             image_path = os.path.join(self.images_path, texture)
             btn = ctk.CTkButton(
@@ -149,7 +225,6 @@ class ImageDropdown(ctk.CTkFrame):
             
     def load_more_textures(self, event=None):
         """Load more textures as user scrolls"""
-        # logger.info("Loading More textures")        
         if hasattr(self, 'remaining_textures') and self.remaining_textures:
             batch = self.remaining_textures[:5]  # Load 5 more
             self.remaining_textures = self.remaining_textures[5:]
@@ -167,24 +242,32 @@ class ImageDropdown(ctk.CTkFrame):
             
     def check_close(self):
         """Check if popup should be closed"""
-        if self.close_scheduled and self.popup:
-            self.popup.destroy()
+        if self.close_scheduled:
+            if self.popup and self.popup.winfo_exists():  # Check before destroying
+                self.popup.destroy()
             self.popup = None
             
     def select_option(self, texture):
-        """Handle texture selection."""
-        # Maintain button text
-        self.button.configure(text="Select Texture")
+        """Handle selection with immediate UI refresh"""
+        if texture in self.selected_textures:
+            return  # Prevent duplicates
         
+        # Ensure textures are only added to their respective category
+        if self.category == "masks" and not texture.startswith("berd_diff_"):
+            return  # Skip non-mask textures for the masks category
+        
+        self.selected_textures.append(texture)
         if self.command:
             self.command(texture)
         if self.popup:
             self.popup.destroy()
             self.popup = None
+        self.set_button_image(texture)
+        # Force parent to refresh dropdowns
+        self.master.master.master.update_texture_display(self.current_item)
             
     def update_preview(self, texture):
         """Update the preview label with the selected texture"""
-        # logger.debug("Updating preview for texture: %s", texture)
         if self.preview_label and texture:
             image_path = os.path.join(self.images_path, texture)
             if os.path.exists(image_path):
@@ -223,32 +306,73 @@ class ImageCache:
                 self._cache.pop(k)
 
 class AsyncImageLoader:
-    def __init__(self, max_workers=2):
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+    def __init__(self, parent):
+        self.parent = parent
         self.image_cache = ImageCache()
         self.load_queue = queue.Queue()
-        self._running = True
-        self.worker_thread = threading.Thread(target=self._process_queue)
-        self.worker_thread.daemon = True
-        self.worker_thread.start()
-        
-    def load_image(self, image_path: str, size: tuple, callback):
-        self.load_queue.put((image_path, size, callback))
-        
-    def clear_category(self, category: str):
-        """Clear cached images for a category"""
-        self.image_cache.remove_category(category)
-        
+        self._running = False  # Start as not running
+        self._lock = threading.Lock()
+        self.worker_thread = None
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.start()
+
+    def start(self):
+        """Start the image loader thread"""
+        with self._lock:
+            if not self._running:
+                self._running = True
+                self.worker_thread = threading.Thread(
+                    target=self._process_queue, 
+                    daemon=True
+                )
+                self.worker_thread.start()
+                logger.debug("Image loader thread started")        
+            
+    def stop(self):
+        """Guaranteed thread termination"""
+        with self._lock:
+            if self._running:
+                logger.debug("Stopping image loader")
+                self._running = False
+                
+                # 1. Send termination signal
+                self.load_queue.put(("TERMINATE", None, None))
+                
+                # 2. Shutdown executor with force
+                self.executor.shutdown(wait=False, cancel_futures=True)
+                
+                # 3. Join thread with timeout
+                if self.worker_thread:
+                    self.worker_thread.join(timeout=0.5)
+                    if self.worker_thread.is_alive():
+                        logger.warning("Forcing thread termination")
+                        del self.worker_thread
+                
+                logger.info("Image loader fully stopped")
+
     def _process_queue(self):
+        """Queue processor with termination handling"""
         while self._running:
             try:
-                image_path, size, callback = self.load_queue.get(timeout=1)
-                self._load_single_image(image_path, size, callback)
+                task = self.load_queue.get(timeout=0.1)
+                if task[0] == "TERMINATE":  # Termination signal
+                    break
+                self._load_single_image(*task)
                 self.load_queue.task_done()
             except queue.Empty:
                 continue
+            except Exception as e:
+                logger.error(f"Queue error: {str(e)}")
+        logger.debug("Process queue exited")        
+        
+    def load_image(self, image_path, size, callback):
+        """Add load task to queue with parent check"""
+        if not self.parent.winfo_exists():  # Critical check
+            return        
+        if self._running and self.parent.winfo_exists():
+            self.load_queue.put((image_path, size, callback))
                 
-    def _load_single_image(self, image_path: str, size: tuple, callback):
+    def _load_single_image(self, image_path, size, callback):
         try:
             cached_image = self.image_cache.get(image_path)
             if cached_image:
@@ -259,24 +383,30 @@ class AsyncImageLoader:
             if size:
                 image.thumbnail(size)
             photo = ctk.CTkImage(image, size=image.size)
-            self.image_cache.set(image_path, photo)
-            callback(photo)
+            if photo:
+                # Check if the application still exists
+                if self._running and not self.parent.winfo_exists():
+                    return
+                callback(photo)
+            else:
+                callback(None)
         except Exception as e:
-            print(f"Error loading image {image_path}: {e}")
+            logger.error(f"Image load failed: {str(e)}")
             callback(None)
             
-    def stop(self):
-        self._running = False
-        self.executor.shutdown()
+    def clear_category(self, category: str):
+        """Clear cached images for a category"""
+        self.image_cache.remove_category(category)
 
 class CategoryView(ctk.CTkFrame):
-    def __init__(self, parent, category: str, base_path: str, image_loader: AsyncImageLoader, 
-                 update_callback, get_preview_image, **kwargs):
+    def __init__(self, parent, category: str, base_path: str, update_callback, get_preview_image, main_app,**kwargs):
         super().__init__(parent, **kwargs)
-        
+        self.dropdowns = {}
+        self.main_app = main_app
+
         self.category = category
         self.base_path = base_path
-        self.image_loader = image_loader
+        self.image_loader = AsyncImageLoader(parent=self)
         self.update_callback = update_callback
         self.get_preview_image = get_preview_image
         self.items_loaded = False
@@ -285,7 +415,8 @@ class CategoryView(ctk.CTkFrame):
         
         # Initialize dictionaries for textures
         self.texture_displays = {}
-        self.item_textures = {}
+        self.item_textures = self._load_initial_state(category)
+
         
         # Create scrollable frame for items
         self.scrollable_frame = ctk.CTkScrollableFrame(self)
@@ -322,6 +453,15 @@ class CategoryView(ctk.CTkFrame):
         self.all_items = []
         self.load_item_list()
 
+    def _load_initial_state(self, category):
+        """Load existing selections from main app's state"""
+        texture_category = f"{category}_textures"
+        return {
+            item: textures 
+            for item, textures in self.main_app.updated_dictionary.get(texture_category, {}).items()
+            if textures
+        }
+
     def load_item_list(self):
         """Load the list of available items without loading images"""
         category_path = os.path.join(self.base_path, self.category)
@@ -342,6 +482,8 @@ class CategoryView(ctk.CTkFrame):
         
     def load_current_page(self):
         """Load items for current page"""
+        self._save_current_state()  # Save before loading new page
+
         # Clear existing items
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
@@ -407,10 +549,14 @@ class CategoryView(ctk.CTkFrame):
             selected_textures_frame = ctk.CTkFrame(texture_container,width=100, height=100)
             selected_textures_frame.pack(side='left', fill='x', expand=True, padx=5)
             self.texture_displays[item_name] = selected_textures_frame
+
+            ctk.CTkLabel(selected_textures_frame, text="No textures selected",height=100).pack()
             
             # Get current textures from state and display them
             texture_category = f"{self.category}_textures"
-            current_textures = self.update_callback(texture_category, item_name, None)
+            current_textures = self.main_app.updated_dictionary.get(texture_category, {})
+            current_textures_for_item = current_textures.get(item_name, [])
+
             if current_textures and item_name in current_textures:
                 if isinstance(current_textures[item_name], str):
                     # Convert single texture to list for backward compatibility
@@ -422,10 +568,14 @@ class CategoryView(ctk.CTkFrame):
             dropdown = ImageDropdown(
                 texture_container,
                 images_path=textures_path,
+                current_value=current_textures_for_item[0] if current_textures_for_item else None,
                 image_loader=self.image_loader,
-                command=lambda t: self.add_texture(item_name, t)
+                command=lambda t: self.add_texture(item_name, t),
+                preview_label=preview_label,
+                selected_textures=current_textures_for_item.copy()  # Use copy to avoid reference 
             )
             dropdown.pack(side='left', padx=5)
+            self.dropdowns[item_name] = dropdown
 
     def update_preview_image(self, label, photo, item_name):
         """Update the preview image, considering current texture state"""
@@ -436,70 +586,113 @@ class CategoryView(ctk.CTkFrame):
             label.configure(image=photo, text="")
 
     def add_texture(self, item_name: str, texture: str):
-        """Add a new texture to the item"""
-        texture_category = f"{self.category}_textures"
-        
-        if texture:
-            # Initialize item_textures if needed
-            if not hasattr(self, 'item_textures'):
-                self.item_textures = {}
-            if item_name not in self.item_textures:
-                self.item_textures[item_name] = []
-                
-            # Add new texture if not already present
-            if texture not in self.item_textures[item_name]:
-                self.item_textures[item_name].append(texture)
-                self.update_texture_display(item_name)
-                
-                # Update the selection state with all textures
-                self.update_callback(texture_category, item_name, self.item_textures[item_name])
-
-    def update_texture_display(self, item_name: str):
-        """Update the display of selected textures"""
-        if item_name in self.texture_displays:
-            display_frame = self.texture_displays[item_name]
-            
-            # Clear existing textures
-            for widget in display_frame.winfo_children():
-                widget.destroy()
-                
-            # Show all selected textures
-            if item_name in self.item_textures and self.item_textures[item_name]:
-                # Calculate size based on number of textures
-                size = min(35, 100 // len(self.item_textures[item_name]))
-                
-                for texture in self.item_textures[item_name]:
-                    image_path = os.path.join(self.base_path, self.category, item_name, "textures", "pics", texture)
-                    
-                    # Create frame for each texture
-                    texture_frame = ctk.CTkFrame(display_frame)
-                    texture_frame.pack(side='left', padx=1)
-                    
-                    # Add texture image
-                    texture_label = ctk.CTkLabel(texture_frame, width=size, height=size, text="")
-                    texture_label.pack(padx=1, pady=1)
-                    
-                    # Add click handler to remove
-                    texture_label.bind("<Button-1>", lambda e, t=texture, i=item_name: self.remove_texture(i, t))
-                    
-                    # Load the image
-                    self.image_loader.load_image(
-                        image_path,
-                        (size, size),
-                        lambda photo, label=texture_label: label.configure(image=photo) if photo else None
-                    )
+        valid_prefix = CATEGORY_PREFIXES.get(self.category)
+        if not texture.startswith(valid_prefix):
+            logger.error(f"Invalid texture {texture} for category {self.category}")
+            return        
+        if item_name not in self.item_textures:
+            self.item_textures[item_name] = []
+        if texture not in self.item_textures[item_name]:
+            logger.debug(f"Adding texture {texture} to item {item_name} in category {self.category}")
+            self.item_textures[item_name].append(texture)
+            logger.info(f"Added texture. {texture} in {item_name}")
+            self._save_current_state()
+            self.update_texture_display(item_name)
+            # Force immediate dropdown refresh
+            for child in self.texture_displays[item_name].winfo_children():
+                if isinstance(child, ImageDropdown):
+                    child.selected_textures = self.item_textures[item_name].copy()
+                    child.show_popup()                     
 
     def remove_texture(self, item_name: str, texture: str, event=None):
-        """Remove a texture from an item"""
         if item_name in self.item_textures and texture in self.item_textures[item_name]:
+            logger.info(f"Removed texture. {texture} in {item_name}")
             self.item_textures[item_name].remove(texture)
+            self._save_current_state()
             self.update_texture_display(item_name)
             
-            # Update the selection state
-            if self.item_textures[item_name]:
-                self.update_callback(f"{self.category}_textures", item_name, self.item_textures[item_name])
-            else:
-                self.update_callback(f"{self.category}_textures", item_name, None)
+            # Update the dropdown for this item
+            if item_name in self.dropdowns:
+                dropdown = self.dropdowns[item_name]
+                dropdown.selected_textures = self.item_textures[item_name].copy()  # Update list
+                \
+
+    def _refresh_dropdowns(self, item_name: str):
+        """Refresh all dropdowns for this item"""
+        if item_name in self.texture_displays:
+            display_frame = self.texture_displays[item_name]
+            for widget in display_frame.winfo_children():
+                if isinstance(widget, ImageDropdown):
+                    widget.selected_textures = self.item_textures.get(item_name, [])
+                    widget.create_popup()
+
+    def update_texture_display(self, item_name: str):
+        """Update texture display with exact sizes, wrapping, and state verification"""
+        logger.info(f"Updating texture display for {item_name} in {self.category}")
+        
+        # Validate widget existence
+        if item_name not in self.texture_displays or not self.texture_displays[item_name].winfo_exists():
+            logger.error(f"Texture display for {item_name} does not exist")
+            return
+            
+        display_frame = self.texture_displays[item_name]
+        
+        # Always use ground truth from main app
+        texture_category = f"{self.category}_textures"
+        current_textures = self.main_app.updated_dictionary.get(texture_category, {}).get(item_name, [])
+        logger.debug(f"Current verified textures for {item_name}: {current_textures}")
+
+        # Nuclear clear of existing widgets
+        for widget in display_frame.winfo_children():
+            logger.debug(f"Destroying widget: {type(widget).__name__}")
+            widget.destroy()
+
+        if not current_textures:
+            logger.info("No textures - showing empty state")
+            ctk.CTkLabel(display_frame, text="No textures selected",height=100).pack()
+            return
+
+        # Dynamic sizing logic
+        num_textures = len(current_textures)
+        size_map = {1: 100, 2: 100, 3: 75, 4: 65, 5: 65}
+        size = size_map.get(num_textures, 65)
+        items_per_row = min(num_textures, 4 if size == 65 else num_textures)
+        
+        logger.debug(f"Rendering {num_textures} texture(s) at {size}px")
+
+        # Grid layout rebuild
+        row = col = 0
+        for idx, texture in enumerate(current_textures):
+            if idx % items_per_row == 0 and idx != 0:
+                row += 1
+                col = 0
+
+            texture_frame = ctk.CTkFrame(
+                display_frame, 
+                width=size, 
+                height=size,
+                fg_color="transparent"
+            )
+            texture_frame.grid(row=row, column=col, padx=(0, 2), pady=(0, 2))
+
+            texture_label = ctk.CTkLabel(texture_frame, text="", width=size, height=size)
+            texture_label.pack()
+
+            # Async image load with error handling
+            image_path = os.path.join(
+                self.base_path, self.category, item_name, 
+                "textures", "pics", texture
+            )
+            self.image_loader.load_image(
+                image_path,
+                (size, size),
+                lambda photo, lbl=texture_label: lbl.configure(image=photo) if photo else None
+            )
+            texture_label.bind("<Button-1>", lambda e, t=texture: self.remove_texture(item_name, t))
+            
+            col += 1
+
+        logger.info(f"Texture display updated for {item_name}")
 
     def update_texture_with_preview(self, item_name: str, texture: str, preview_label: ctk.CTkLabel):
         """Update texture and show preview"""
@@ -516,39 +709,74 @@ class CategoryView(ctk.CTkFrame):
             preview_label.configure(image=None, text="") 
                 
     def prev_page(self):
-        """Load previous page and scroll to top"""
+        """Save current page state before navigation"""
+        self._save_current_state()
         if self.current_page > 0:
             self.current_page -= 1
             self.load_current_page()
             self.update_navigation()
-            # Scroll to top
-            self.scrollable_frame._parent_canvas.yview_moveto(0)
-            
+
     def next_page(self):
-        """Load next page and scroll to top"""
+        """Save current page state before navigation"""
+        self._save_current_state()
         total_pages = (len(self.all_items) + self.items_per_page - 1) // self.items_per_page
         if self.current_page < total_pages - 1:
             self.current_page += 1
             self.load_current_page()
             self.update_navigation()
-            # Scroll to top
-            self.scrollable_frame._parent_canvas.yview_moveto(0)
-            
+
+    def _save_current_state(self):
+        """Persist current selections to main app's state"""
+        texture_category = f"{self.category}_textures"
+        logger.debug(f"Saving state for {texture_category}: {self.item_textures}")
+        # Update main app's dictionary with deep copy
+        self.main_app.updated_dictionary[texture_category] = {
+            item: textures.copy() 
+            for item, textures in self.item_textures.items()
+            if textures
+        }
+        logger.debug(f"Saved state for {texture_category}")
+
+    def update_selection_state(self, item_name: str, selected: bool):
+        """Handle item selection with checkbox sync"""
+        super().update_selection_state(item_name, selected)  # Keep existing logic
+        
+        # Notify main app to sync checkboxes
+        self.main_app._sync_checkbox_states()
+        self.main_app.update_texture_display()
+
     def cleanup(self):
-        """Clean up resources when view is closed"""
-        self.image_loader.clear_category(self.category)
+        """Nuclear cleanup for category view"""
+        logger.info(f"Cleaning up {self.category} view")
+        
+        # 1. Stop image loader
+        self.image_loader.stop()
+        
+        # 2. Destroy all widgets
+        for widget in self.winfo_children():
+            widget.destroy()
+        
+        # 3. Clear references
+        self.master = None
+        self.image_loader = None
+        logger.debug(f"{self.category} view resources released")
 
 class ClothesSelectionWindow(ctk.CTkToplevel):
-    def __init__(self, parent, categories: List[str], base_path: str, image_loader: AsyncImageLoader,
-                 update_callback, get_preview_image, **kwargs):
-        super().__init__(parent, **kwargs)
+    def __init__(self, parent, categories: List[str], base_path: str,
+                 update_callback, get_preview_image, image_loader,**kwargs):
+        super().__init__(parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Add these new properties
+        self.remaining_textures = {}  # Track textures across closure
+        self.category_views = {}  # Track active category views
+        self.image_loader = parent.image_loader
+        self.main_app = parent
         
         self.title("Select Items")
         self.geometry("800x600")
         
         self.categories = categories
         self.base_path = base_path
-        self.image_loader = image_loader
         self.update_callback = update_callback
         self.get_preview_image = get_preview_image  # Store the method
         self.current_category = None
@@ -591,31 +819,53 @@ class ClothesSelectionWindow(ctk.CTkToplevel):
         """Switch to showing a different category"""
         if self.current_category == category:
             return
-            
-        # Clean up current category view
+
+        # Destroy existing category view completely
         if self.category_view:
-            self.category_view.cleanup()
-            self.category_view.destroy()
-            
+            self.category_view.destroy() 
+            self.category_view = None
+
+        # Clear the content frame to prevent widget stacking
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+
         # Create new category view
         self.category_view = CategoryView(
             self.content_frame,
             category,
             self.base_path,
-            self.image_loader,
             self.update_callback,
-            self.get_preview_image  # Pass the method
+            self.get_preview_image,
+            self.main_app
         )
         self.category_view.pack(expand=True, fill='both')
         self.current_category = category
 
+    def _on_close(self):
+        """Safe window closure"""
+        logger.info(f"Closing {self.option_name} window")
+        
+        # 1. Stop all image loaders
+        if hasattr(self, 'category_view'):
+            self.category_view.cleanup()
+        
+        # 2. Remove from window registry
+        if self.option_name in self.master.selection_windows:
+            del self.master.selection_windows[self.option_name]
+        
+        # 3. Delay destruction for thread cleanup
+        self.after(100, self.destroy)
+        logger.debug("Window closure processed")
+
 class PedCreatorGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        
+        self._is_destroyed = False
+        self.image_loader = AsyncImageLoader(parent=self)
+        self.protocol("WM_DELETE_WINDOW", self._safe_destroy)
+
         # Basic window setup
-        self.image_loader = AsyncImageLoader()
-        self.title(f"FiveM Ped Creator - Running on v{sys.version.split()[0]}")
+        self.title(f"FiveM Ped Creator - Made By Fucking ! Lucas.exe™")
         self.iconbitmap("icon.ico")
         self.geometry("1000x700")
         self.resizable(False, False)
@@ -663,6 +913,9 @@ class PedCreatorGUI(ctk.CTk):
             "body_textures": {}
         }
         
+        # Log the initial state of the dictionary
+        logging.debug(f"Initial updated_dictionary: {self.updated_dictionary}")
+        
         self.clothes_path = MALE_PATH
         self.font = "Supernova"
         self.iconpath = "icon.png"
@@ -693,12 +946,12 @@ class PedCreatorGUI(ctk.CTk):
             return
             
         window = ClothesSelectionWindow(
-            self,
+            self,  # <-- Changed from parent=self to pass main app reference
             categories,
             self.clothes_path,
-            self.image_loader,
             self.update_selection,
-            self.get_preview_image  # Pass the method
+            self.get_preview_image,
+            self.image_loader
         )
         window.transient(self)
         window.grab_set()
@@ -710,9 +963,9 @@ class PedCreatorGUI(ctk.CTk):
         """Create checkboxes for all ped options with associated category mappings"""
         options = [
             ("Hands", 85, 150, ["hands"]),
-            ("Face", 286, 150, ["face"]),
+            ("Head", 286, 150, ["model","texture"]),
             ("Hair", 85, 195, ["hairs"]),
-            ("Body", 286, 195, ["body"]),
+            ("Body", 286, 195, ["model","texture"]),
             ("Accessories", 85, 240, ["accs", "bags", "chains", "glasses", "hats", "masks", "watches"]),
             ("Clothes", 286, 240, ["shirts", "pants", "shoes", "under_shirt", "vests", "decals"])
         ]
@@ -814,19 +1067,65 @@ class PedCreatorGUI(ctk.CTk):
         self.open_clothes_selection(option_name, categories)
 
     def on_checkbox_click(self, option_name: str, categories: List[str]):
-        """Handle checkbox clicks by opening the clothes selection window"""
+        logger.info(f"Checkbox clicked: {option_name} | Categories: {categories}")
+        
         checkbox_info = self.checkboxes[option_name]
-        if checkbox_info["checkbox"].get():
+        is_checked = checkbox_info["checkbox"].get()
+        logger.debug(f"Checkbox state: {'Checked' if is_checked else 'Unchecked'}")
+
+        if is_checked:
+            logger.info(f"Opening selection window for {option_name}")
             checkbox_info["edit_button"].configure(state='normal')
             self.open_clothes_selection(option_name, categories)
         else:
+
+            self.after(500, lambda: self._actually_clear_data(option_name, categories))
+
+            logger.warning(f"Clearing data for categories: {categories}")
             checkbox_info["edit_button"].configure(state='disabled')
-            # Clear selections for these categories
+            
+            # Clear data and textures
             for category in categories:
+                logger.debug(f"Resetting {category} and {category}_textures")
                 self.updated_dictionary[category] = []
+                self.updated_dictionary[f"{category}_textures"] = {}
+
+            # Log the updated dictionary state
+            logging.debug(f"Updated dictionary after clearing data: {self.updated_dictionary}")
+
+            # Destroy window and force UI refresh
             if option_name in self.selection_windows:
-                self.selection_windows[option_name].destroy()
+                logger.debug(f"Destroying window for {option_name}")
+                window = self.selection_windows[option_name]
+                window.destroy()
                 del self.selection_windows[option_name]
+
+            # Force refresh of ALL UI components
+            self._sync_checkbox_states()
+            self._refresh_builder_frame()  # New method added below
+        
+    def _actually_clear_data(self, option_name, categories):
+        """Thread-safe data clearance"""
+        logger.debug("Executing safe data clearance")
+
+    def refresh_all_textures(self):
+        """Force refresh all texture displays"""
+        logger.info("Global texture refresh initiated")
+        for window in self.selection_windows.values():
+            if hasattr(window, 'category_view') and window.category_view:
+                window.category_view.load_current_page()
+
+    def _refresh_builder_frame(self):
+        """Refresh visible components without full recreation"""
+        logger.info("Refreshing builder frame")
+        # Update existing widgets
+        for child in self.builder_frame.winfo_children():
+            if isinstance(child, ctk.CTkFrame):
+                for subchild in child.winfo_children():
+                    if isinstance(subchild, ctk.CTkCheckBox):
+                        subchild.configure(text=f"Item {subchild._text.split()[-1]}")
+        # Force GUI update
+        self.update_idletasks()
 
     def update_texture(self, category: str, item_name: str, texture: str):
         """Update the texture selection for an item"""
@@ -845,38 +1144,38 @@ class PedCreatorGUI(ctk.CTk):
             if item_name in self.updated_dictionary[texture_category]:
                 del self.updated_dictionary[texture_category][item_name]
 
+        # Log the updated dictionary state
+        logging.debug(f"Updated dictionary after texture change: {self.updated_dictionary}")
 
-    def update_selection(self, category: str, item_name: str, selected):
-        """Update the selection in the dictionary"""
-        if item_name is None and selected is None:
-            # Return current selections for the category
-            return self.updated_dictionary.get(category, [] if not category.endswith('_textures') else {})
-            
+    def update_selection(self, category, item_name, selected):
+        """Central state update with texture awareness"""
+        logger.debug(f"Updating selection: category={category}, item_name={item_name}, selected={selected}")
         if category.endswith("_textures"):
-            if selected is None:
-                # Remove textures for this item
+            base_category = category.replace('_textures', '')
+            if selected is not None:
+                logger.debug(f"Adding texture: {selected} to {category}")
+                self.updated_dictionary[category][item_name] = selected.copy()
+                # Ensure main category has the item
+                if item_name not in self.updated_dictionary[base_category]:
+                    self.updated_dictionary[base_category].append(item_name)
+            else:
+                logger.debug(f"Removing texture: {item_name} from {category}")
                 if item_name in self.updated_dictionary[category]:
                     del self.updated_dictionary[category][item_name]
-            else:
-                # Initialize texture dictionary if needed
-                if category not in self.updated_dictionary:
-                    self.updated_dictionary[category] = {}
-                # Update textures
-                self.updated_dictionary[category][item_name] = selected.copy() if isinstance(selected, list) else selected
         else:
-            # Handle regular categories (lists)
+            # Existing non-texture handling
             if selected and item_name not in self.updated_dictionary[category]:
+                logger.debug(f"Adding item: {item_name} to {category}")
                 self.updated_dictionary[category].append(item_name)
             elif not selected and item_name in self.updated_dictionary[category]:
+                logger.debug(f"Removing item: {item_name} from {category}")
                 self.updated_dictionary[category].remove(item_name)
-                
-                # Also remove any associated textures
-                texture_category = f"{category}_textures"
-                if texture_category in self.updated_dictionary and item_name in self.updated_dictionary[texture_category]:
-                    del self.updated_dictionary[texture_category][item_name]
+        
+        # Log the updated dictionary state
+        logging.debug(f"Updated dictionary after selection change: {self.updated_dictionary}")
         
         return self.updated_dictionary.get(category, [] if not category.endswith('_textures') else {})
-    
+        
     def on_selection_window_close(self, option_name: str):
         """Properly handle window close and maintain selections"""
         if option_name in self.selection_windows:
@@ -884,21 +1183,31 @@ class PedCreatorGUI(ctk.CTk):
             
             # Save state before closing
             if hasattr(selection_window.category_view, 'item_textures'):
-                for category in self.checkboxes[option_name]["categories"]:
-                    texture_category = f"{category}_textures"
-                    
-                    # Restore textures from the view's state
-                    if texture_category in self.updated_dictionary:
-                        for item_name, textures in selection_window.category_view.item_textures.items():
-                            if textures:
-                                self.updated_dictionary[texture_category][item_name] = textures.copy()
-                            else:
-                                if item_name in self.updated_dictionary[texture_category]:
-                                    del self.updated_dictionary[texture_category][item_name]
+                # Get the specific texture category for the current option_name
+                texture_category = f"{option_name}_textures"
+                
+                # Ensure the texture category exists in the updated dictionary
+                if texture_category not in self.updated_dictionary:
+                    self.updated_dictionary[texture_category] = {}
+                
+                # Only update textures for the specific category being closed
+                for item_name, textures in selection_window.category_view.item_textures.items():
+                    # Only update textures for items that belong to the current category
+                    if item_name in self.updated_dictionary.get(option_name, []):
+                        if textures:
+                            self.updated_dictionary[texture_category][item_name] = textures.copy()
+                        else:
+                            # Remove the item if it has no textures
+                            if item_name in self.updated_dictionary[texture_category]:
+                                del self.updated_dictionary[texture_category][item_name]
             
+            # Destroy the window and remove it from the selection_windows dictionary
             selection_window.destroy()
             del self.selection_windows[option_name]
             
+        # Log the updated dictionary state
+        logging.debug(f"Updated dictionary after window close: {self.updated_dictionary}")
+
         # Update checkbox states
         self._update_checkbox_states(option_name)
 
@@ -916,6 +1225,7 @@ class PedCreatorGUI(ctk.CTk):
         else:
             self.checkboxes[option_name]["checkbox"].select()
             self.checkboxes[option_name]["edit_button"].configure(state='normal')
+
     def setup_navigation_frame(self):
         """Setup the navigation sidebar"""
         self.navigation_frame = ctk.CTkFrame(self, corner_radius=0)
@@ -948,6 +1258,24 @@ class PedCreatorGUI(ctk.CTk):
             command=self.show_builder
         )
         self.dashboard_button.grid(row=1, column=0, sticky="ew")
+
+    def _sync_checkbox_states(self):
+        """Update checkbox states based on actual selections"""
+        for option_name, checkbox_info in self.checkboxes.items():
+            has_selections = False
+            for category in checkbox_info["categories"]:
+                # Check both items and textures
+                if (self.updated_dictionary.get(category) or 
+                    self.updated_dictionary.get(f"{category}_textures")):
+                    has_selections = True
+                    break
+            
+            # Update visual state
+            checkbox = checkbox_info["checkbox"]
+            current_state = checkbox.get()
+            if has_selections != current_state:
+                checkbox.toggle()  # Force state change if mismatch
+            checkbox_info["edit_button"].configure(state="normal" if has_selections else "disabled")
 
     def setup_builder_frame(self):
         """Setup the main builder frame"""
@@ -1028,8 +1356,68 @@ class PedCreatorGUI(ctk.CTk):
         """Show the builder frame"""
         self.builder_frame.grid(row=0, column=1, sticky="nsew")
 
+    def create_progress_window(self):
+        """Create a modern progress window"""
+        progress_window = ctk.CTkToplevel(self)
+        progress_window.title("Building Ped")
+        progress_window.geometry("400x150")
+        
+        # Center the window
+        screen_width = progress_window.winfo_screenwidth()
+        screen_height = progress_window.winfo_screenheight()
+        x = (screen_width - 400) // 2
+        y = (screen_height - 150) // 2
+        progress_window.geometry(f"+{x}+{y}")
+        
+        # Make window non-resizable and always on top
+        progress_window.resizable(False, False)
+        progress_window.transient(self)
+        progress_window.grab_set()
+        
+        # Status label
+        self.status_label = ctk.CTkLabel(
+            progress_window,
+            text="Processing files...",
+            font=ctk.CTkFont(size=15, family=self.font)
+        )
+        self.status_label.pack(pady=(20, 0))
+        
+        # Progress frame with purple accent
+        progress_frame = ctk.CTkFrame(progress_window, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=20, pady=10)
+        
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(
+            progress_frame,
+            width=300,
+            height=15,
+            corner_radius=10,
+            fg_color=("#F0F0F0", "#2A2A2A"),  # Light/dark mode colors
+            progress_color=PURPLE,
+            border_width=0
+        )
+        self.progress_bar.pack(pady=10)
+        self.progress_bar.set(0)
+        
+        # Percentage label
+        self.percentage_label = ctk.CTkLabel(
+            progress_frame,
+            text="0%",
+            font=ctk.CTkFont(size=13, family=self.font)
+        )
+        self.percentage_label.pack()
+        
+        return progress_window
+
+    def update_progress(self, progress_window, progress, status=None):
+        """Update progress bar and status"""
+        self.progress_bar.set(progress)
+        self.percentage_label.configure(text=f"{int(progress * 100)}%")
+        if status:
+            self.status_label.configure(text=status)
+        progress_window.update()
+
     def build_ped(self):
-        """Handle the ped building process"""
         name = self.name_entry.get().strip()
         if not name:
             self.create_message_box("Error", "Please enter a ped name")
@@ -1040,7 +1428,6 @@ class PedCreatorGUI(ctk.CTk):
         selected_options = {}
         
         for category, items in self.updated_dictionary.items():
-            # Skip non-list items and empty categories
             if not isinstance(items, list) or category == "name":
                 continue
                 
@@ -1048,27 +1435,64 @@ class PedCreatorGUI(ctk.CTk):
                 any_selected = True
                 selected_options[category] = items
                 
-                # Add textures if they exist for this category
-                if f"{category}_textures" in self.updated_dictionary:
-                    selected_options[f"{category}_textures"] = self.updated_dictionary[f"{category}_textures"]
-                    
+                # Only add textures if they exist and are relevant to the category
+                texture_category = f"{category}_textures"
+                if texture_category in self.updated_dictionary and self.updated_dictionary[texture_category]:
+                    selected_options[texture_category] = self.updated_dictionary[texture_category]
+                        
         if not any_selected:
             self.create_message_box("Error", "Please select at least one item")
             return
-            
+                
         try:
-            # Add name to the selected options
+            import json
+            import os
+            
+            save_path = os.path.join(os.path.dirname(__file__), 'saved_selections.json')
+
+            # Clear all data and prepare new data to save
+            existing_data = {}  # <-- Start with an empty dictionary
             selected_options["name"] = name
+            existing_data[name] = selected_options  # <-- Add the current ped's data
+
+            # Log the data being saved
+            logging.debug(f"Data being saved: {existing_data}")
+
+            # Atomic write with temporary file
+            temp_path = save_path + ".tmp"
+            with open(temp_path, 'w') as file:
+                json.dump(existing_data, file, indent=4)
+            
+            # Replace original file
+            if os.path.exists(save_path):
+                os.replace(temp_path, save_path)
+            else:
+                os.rename(temp_path, save_path)
+                
+            # Show progress window
+            progress_window = self.create_progress_window()
+            
+            def progress_callback(progress, status=None):
+                self.update_progress(progress_window, progress, status)
             
             # Initialize FileHandler and process the files
             from file_handler import FileHandler
-            FileHandler.copy_files(selected_options, name)
+            # Determine base path based on gender
+            base_path = MALE_PATH if self.gender_var.get() == "male" else FEMALE_PATH
+            
+            # Pass base_path to FileHandler
+            FileHandler.copy_files(selected_options, name, base_path, progress_callback)
+                    
+            # Complete the progress bar
+            self.update_progress(progress_window, 1.0, "Complete!")
+            self.after(1000, progress_window.destroy)
             
             # Show success message
             self.create_message_box("success", f"Ped '{name}' has been successfully created!")
 
         except Exception as e:
-            # Show detailed error message
+            if 'progress_window' in locals():
+                progress_window.destroy()
             self.create_message_box("error", f"An error occurred while building the ped:\n{str(e)}")
 
     def create_message_box(self, message_type, message):
@@ -1111,7 +1535,21 @@ class PedCreatorGUI(ctk.CTk):
         y = (screen_height - message_box.winfo_height()) // 2
         message_box.geometry(f"+{x}+{y}")
 
+    def _safe_destroy(self):
+        """Proper cleanup sequence"""
+        
+        if not self._is_destroyed:
+            # Stop all image loading first
+            self.image_loader.stop()
+            
+            # Close all selection windows
+            for window in list(self.selection_windows.values()):
+                window.destroy()
+            
+            # Then destroy main window
+            super().destroy()
+            self._is_destroyed = True
+            logger.info("Application shutdown complete")
+
     def destroy(self):
-        """Clean up resources"""
-        self.image_loader.stop()
-        super().destroy()        
+        self._safe_destroy()

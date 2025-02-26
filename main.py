@@ -4,10 +4,7 @@ from gui import PedCreatorGUI
 # main.py
 def main():
     app = PedCreatorGUI()
-    try:
-        app.mainloop()
-    finally:
-        app.destroy()
+    app.mainloop()  # Let Tkinter handle destruction automatically
 
 if __name__ == "__main__":
     main()
