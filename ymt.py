@@ -1,5 +1,7 @@
 import xml.etree.ElementTree as ET
+import subprocess
 import logging
+import json
 import sys
 import os
 
@@ -113,13 +115,18 @@ def add_component_item(comp_data, component_id, textures):
 
     for texture_id, textures_list in textures.items():
         drawbl_item = ET.SubElement(drawbl_data, "Item")
-        ET.SubElement(drawbl_item, "propMask", value="1")
+        
+        # Check if any texture name in the list contains "_uni"
+        has_uni = any("_uni" in texture_name for texture_name in textures_list)
+        prop_mask_value = "1" if has_uni else "17"
+        
+        ET.SubElement(drawbl_item, "propMask", value=prop_mask_value)
         ET.SubElement(drawbl_item, "numAlternatives", value="0")
         tex_data = ET.SubElement(drawbl_item, "aTexData", itemType="CPVTextureData")
 
-        for texture in textures_list:
+        for texture_index, texture in enumerate(textures_list):
             tex_item = ET.SubElement(tex_data, "Item")
-            ET.SubElement(tex_item, "texId", value="0")
+            ET.SubElement(tex_item, "texId", value="0" if "_uni" in texture else "1")
             ET.SubElement(tex_item, "distribution", value="255")
 
         cloth_data = ET.SubElement(drawbl_item, "clothData")
@@ -138,26 +145,70 @@ def add_component_data(root, ped_data):
             textures = ped_data[f"{category}_textures"]
             add_component_item(comp_data, slot, textures)
 
-# Function to add component info
 def add_component_info(root, ped_data):
     comp_infos = ET.SubElement(root, "compInfos", itemType="CComponentInfo")
     logging.info("Component info section added to XML.")
 
+    # Mapping of component categories to their respective IDs
+    COMPONENT_IDS = {
+        "head": 0,
+        "berd": 1,
+        "hair": 2,
+        "uppr": 3,
+        "lowr": 4,
+        "hand": 5,
+        "feet": 6,
+        "teef": 7,
+        "accs": 8,
+        "task": 9,
+        "decl": 10,
+        "jbib": 11
+    }
+
+    # Create a list to store all component info items
+    component_info_items = []
+
     for category, textures in ped_data.items():
         if "_textures" not in category and category != "name":
-            for component_id in ped_data[category]:
-                comp_info = ET.SubElement(comp_infos, "Item")
-                ET.SubElement(comp_info, "hash_2FD08CEF").text = "none"
-                ET.SubElement(comp_info, "hash_FC507D28").text = "none"
-                ET.SubElement(comp_info, "hash_07AE529D").text = "0 0 0 0 0"
-                ET.SubElement(comp_info, "flags", value="0")
-                ET.SubElement(comp_info, "inclusions").text = "0"
-                ET.SubElement(comp_info, "exclusions").text = "0"
-                ET.SubElement(comp_info, "hash_6032815C").text = "PV_COMP_HEAD"
-                ET.SubElement(comp_info, "hash_7E103C8B", value="0")
-                ET.SubElement(comp_info, "hash_D12F579D", value=str(component_id))
-                ET.SubElement(comp_info, "hash_FA1F27BF", value="0")
-                logging.info(f"Added component info for ID: {component_id} in category: {category}")
+            # Get the component ID based on the category
+            component_id = COMPONENT_IDS.get(CATEGORY_PREFIXES.get(category, ""), -1)
+            if component_id == -1:
+                logging.warning(f"Unknown category: {category}. Skipping component info.")
+                continue
+
+            # Get the drawable indices for this category
+            drawable_indices = sorted(ped_data[f"{category}_textures"].keys(), key=lambda x: int(x))
+
+            for drawable_index in drawable_indices:
+                # Create a dictionary to store the component info
+                component_info = {
+                    "component_id": component_id,
+                    "drawable_index": drawable_index
+                }
+                component_info_items.append(component_info)
+
+    # Sort the component info items by component ID and drawable index
+    component_info_items.sort(key=lambda x: (x["component_id"], int(x["drawable_index"])))
+
+    # Add the sorted component info items to the XML
+    for item in component_info_items:
+        comp_info = ET.SubElement(comp_infos, "Item")
+        ET.SubElement(comp_info, "hash_2FD08CEF").text = "none"
+        ET.SubElement(comp_info, "hash_FC507D28").text = "none"
+        ET.SubElement(comp_info, "hash_07AE529D").text = "0 0 0 0 0"
+        ET.SubElement(comp_info, "flags", value="0")
+        ET.SubElement(comp_info, "inclusions").text = "0"
+        ET.SubElement(comp_info, "exclusions").text = "0"
+        ET.SubElement(comp_info, "hash_6032815C").text = "PV_COMP_HEAD"
+        ET.SubElement(comp_info, "hash_7E103C8B", value="0")
+
+        # Set component ID (infoHash_D12F579D)
+        ET.SubElement(comp_info, "hash_D12F579D", value=str(item["component_id"]))
+
+        # Set drawable index (infoHash_FA1F27BF)
+        ET.SubElement(comp_info, "hash_FA1F27BF", value=str(item["drawable_index"]))
+
+        logging.info(f"Added component info for component ID: {item['component_id']}, drawable index: {item['drawable_index']}")
 
 # Function to add props and anchors
 def add_props_and_anchors(root, ped_data):
@@ -222,7 +273,7 @@ def add_prop_item(prop_meta_data, prop_id, textures, prop_prefix):
         tex_item = ET.SubElement(tex_data, "Item")
         ET.SubElement(tex_item, "inclusions").text = "0"
         ET.SubElement(tex_item, "exclusions").text = "0"
-        ET.SubElement(tex_item, "texId", value=str(texture_index))  # Dynamic texId based on texture index
+        ET.SubElement(tex_item, "texId", value="0" if "_uni" in texture else "1") # Dynamic texId based on texture index
         ET.SubElement(tex_item, "inclusionId", value="0")
         ET.SubElement(tex_item, "exclusionId", value="0")
         ET.SubElement(tex_item, "distribution", value="255")
@@ -247,6 +298,15 @@ def add_prop_item(prop_meta_data, prop_id, textures, prop_prefix):
 
     logging.info(f"Added prop item with ID: {prop_id} and {len(textures)} textures for category: {prop_prefix}.")
 
+# Function to convert XML to YMT using an external tool
+def convert_xml_to_ymt(xml_file, ymt_file):
+    try:
+        # Replace 'XmlToYmtConverter.exe' with the actual path to your C# executable
+        subprocess.run(["ymtexe/XmlToYmtConverter.exe", xml_file, ymt_file], check=True)
+        logging.info(f"Successfully converted {xml_file} to {ymt_file}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to convert XML to YMT: {e}")
+
 # Main function to generate the XML
 def generate_xml(ped_data, ped_name):
     # Create XML root
@@ -265,22 +325,57 @@ def generate_xml(ped_data, ped_name):
     add_props_and_anchors(root, ped_data)
 
     # Add DLC name
-    ET.SubElement(root, "dlcName").text = ""
+    dlc_name = ET.SubElement(root, "dlcName")
+    dlc_name.text = ""  # Ensure it's empty 
+    ET.tostring(root, encoding="unicode")
     logging.info("DLC name added to XML.")
 
     # Add indentation and line breaks to the XML
     indent(root)
     logging.info("XML indentation and line breaks added.")
 
-    # Write XML to file
+    # Write XML to a temporary file
+    temp_xml_file = f"{ped_name}.temp.xml"
     try:
         tree = ET.ElementTree(root)
-        tree.write(f"{ped_name}.ymt.xml", encoding="utf-8", xml_declaration=True)
-        logging.info(f"XML file written successfully: {ped_name}.ymt.xml")
+        with open(temp_xml_file, "wb") as f:  # Open in binary mode
+            f.write(b'\xef\xbb\xbf')  # Write the UTF-8 BOM
+            tree.write(f, encoding="utf-8", xml_declaration=True)
+        logging.info(f"Temporary XML file written successfully: {temp_xml_file}")
     except Exception as e:
-        logging.error(f"Failed to write XML file: {e}")
+        logging.error(f"Failed to write temporary XML file: {e}")
+        return
 
+    # Convert the temporary XML file to YMT
+    ymt_file = f"{ped_name}.ymt"
+    convert_xml_to_ymt(temp_xml_file, ymt_file)
+
+    # Clean up the temporary XML file
+    try:
+        os.remove(temp_xml_file)
+        logging.info(f"Temporary XML file removed: {temp_xml_file}")
+    except Exception as e:
+        logging.error(f"Failed to remove temporary XML file: {e}")
+
+# Function to load JSON file for testing
+def load_json_file(json_file):
+    try:
+        with open(json_file, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load JSON file: {e}")
+        return None
+    
 # Run the script
 if __name__ == "__main__":
-    print("Cannot run file alone :(")
-    sys.exit()
+    # Load JSON file for testing
+    json_file = "ymt-saved_selections.json"
+    ped_data = load_json_file(json_file)
+    
+    if ped_data:
+        # Generate XML for each ped in the JSON file
+        for ped_name, ped_info in ped_data.items():
+            generate_xml(ped_info, ped_name)
+    else:
+        print("Failed to load JSON file. Exiting.")
+        sys.exit()
