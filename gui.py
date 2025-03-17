@@ -1,15 +1,17 @@
-import customtkinter as ctk
-from config import *
-from PIL import Image
-import os
-import time
-from typing import Dict, List, Optional
-import tkinter as tk
-from tkinter import ttk, messagebox
-import threading
 from concurrent.futures import ThreadPoolExecutor
-import queue
+from typing import Dict, List, Optional
+from tkinter import ttk, messagebox
 from functools import partial
+from ymt import generate_xml
+import customtkinter as ctk
+from PIL import Image
+from config import *
+import tkinter as tk
+import threading
+import queue
+import time
+import sys
+import os
 
 class ImageDropdown(ctk.CTkFrame):
     def __init__(self, master, images_path, current_value, image_loader, command, preview_label, selected_textures):
@@ -21,7 +23,7 @@ class ImageDropdown(ctk.CTkFrame):
 
         super().__init__(master)
 
-        self.image_loader = AsyncImageLoader(parent=self)
+        self.image_loader = AsyncImageLoader.get_instance(self)
 
         self.button = ctk.CTkButton(
             self,
@@ -95,7 +97,7 @@ class ImageDropdown(ctk.CTkFrame):
             self.popup.deiconify()
             
         except Exception as e:
-            logger.error(f"Popup rebuild failed: {str(e)}")
+            logger.exception(f"Popup rebuild failed: {str(e)}")
 
     def _handle_texture_selection(self, texture):
         """Direct selection handling with UI update"""
@@ -109,7 +111,7 @@ class ImageDropdown(ctk.CTkFrame):
                 self.popup.destroy()
                 self.popup = None
         except Exception as e:
-            logger.error(f"Selection failed: {str(e)}")
+            logger.exception(f"Selection failed: {str(e)}")
 
     def _safe_update_button(self, button, photo):
         """Thread-safe button update"""
@@ -170,7 +172,7 @@ class ImageDropdown(ctk.CTkFrame):
                 widget.bind('<Leave>', lambda e: self.schedule_close())
                 
         except Exception as e:
-            logger.error(f"Popup creation failed: {str(e)}")
+            logger.exception(f"Popup creation failed: {str(e)}")
             
     def set_button_image(self, texture):
         try:
@@ -194,7 +196,7 @@ class ImageDropdown(ctk.CTkFrame):
             else:
                 self.button.configure(image=None, text="Select Texture")
         except Exception as e:
-            logger.error(f"Image error: {e}")
+            logger.exception(f"Image error: {e}")
             self.button.configure(image=None, text="Select Texture")
 
     def load_textures_batch(self, parent, textures):
@@ -277,126 +279,304 @@ class ImageDropdown(ctk.CTkFrame):
                     lambda photo: self.preview_label.configure(image=photo, text="") if photo else None
                 )
 
+import threading
+import queue
+import logging
+import uuid
+import time
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+import customtkinter as ctk
+
+logger = logging.getLogger(__name__)
+
 class ImageCache:
-    def __init__(self):
-        self._cache = {}
-        self._lock = threading.Lock()
-        self._max_size = 50  # Reduced cache size since we're loading less at once
+    """Simple image cache implementation"""
+    def __init__(self, max_size=100):
+        self.cache = {}
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.categories = {}  # Map of category -> set of paths
         
-    def get(self, key: str) -> Optional[ctk.CTkImage]:
-        with self._lock:
-            return self._cache.get(key)
+    def get(self, image_path):
+        with self.lock:
+            return self.cache.get(image_path)
+    
+    def put(self, image_path, image, category=None):
+        with self.lock:
+            # Enforce size limit with simple LRU-like eviction
+            if len(self.cache) >= self.max_size:
+                # Remove oldest item (first added)
+                if self.cache:
+                    oldest = next(iter(self.cache))
+                    del self.cache[oldest]
             
-    def set(self, key: str, value: ctk.CTkImage):
-        with self._lock:
-            if len(self._cache) >= self._max_size:
-                # Remove oldest item if cache is full
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = value
+            self.cache[image_path] = image
             
-    def clear(self):
-        with self._lock:
-            self._cache.clear()
-            
-    def remove_category(self, category_prefix: str):
-        """Remove all images from a specific category"""
-        with self._lock:
-            keys_to_remove = [k for k in self._cache if k.startswith(category_prefix)]
-            for k in keys_to_remove:
-                self._cache.pop(k)
+            # Track by category if provided
+            if category:
+                if category not in self.categories:
+                    self.categories[category] = set()
+                self.categories[category].add(image_path)
+    
+    def remove_category(self, category):
+        with self.lock:
+            if category in self.categories:
+                # Remove all images in this category
+                for path in self.categories[category]:
+                    if path in self.cache:
+                        del self.cache[path]
+                # Clear category tracking
+                del self.categories[category]
 
 class AsyncImageLoader:
+    """Thread-safe image loader with lifecycle management"""
+    _instances = {}  # Track instances by parent
+    
+    @classmethod
+    def get_instance(cls, parent):
+        """Get or create an instance for the given parent"""
+        parent_id = str(id(parent))
+        if parent_id not in cls._instances:
+            cls._instances[parent_id] = AsyncImageLoader(parent)
+        return cls._instances[parent_id]
+    
+    @classmethod
+    def cleanup_instances(cls):
+        """Clean up instances for destroyed parents"""
+        to_remove = []
+        for parent_id, instance in cls._instances.items():
+            if not instance.parent.winfo_exists():
+                instance.stop()
+                to_remove.append(parent_id)
+        
+        for parent_id in to_remove:
+            del cls._instances[parent_id]
+    
     def __init__(self, parent):
+        """Initialize the image loader"""
         self.parent = parent
         self.image_cache = ImageCache()
         self.load_queue = queue.Queue()
-        self._running = False  # Start as not running
+        self._running = False
         self._lock = threading.Lock()
         self.worker_thread = None
         self.executor = ThreadPoolExecutor(max_workers=2)
+        self.active_tasks = set()
+        self.max_concurrent_tasks = 10
+        self.last_activity = time.time()
+        
+        # Setup automatic cleanup when parent is destroyed
+        if hasattr(parent, "bind") and callable(parent.bind):
+            try:
+                parent.bind("<Destroy>", lambda e: self.stop(), add="+")
+            except Exception as e:
+                logger.warning(f"Could not bind destroy event: {e}")
+        
+        # Auto-start (controlled)
         self.start()
-
+    
     def start(self):
-        """Start the image loader thread"""
+        """Start the image loader thread if not already running"""
         with self._lock:
             if not self._running:
+                # Check if thread exists and is alive
+                if self.worker_thread and self.worker_thread.is_alive():
+                    logger.warning("Thread already running, not starting a new one")
+                    self._running = True
+                    return
+                    
                 self._running = True
+                
+                # Initialize a new thread if needed
                 self.worker_thread = threading.Thread(
                     target=self._process_queue, 
-                    daemon=True
+                    daemon=True,
+                    name="AsyncImageLoader"
                 )
                 self.worker_thread.start()
-                logger.debug("Image loader thread started")        
-            
+                logger.debug("Image loader thread started")
+    
     def stop(self):
-        """Guaranteed thread termination"""
+        """Safely stop the image loader thread"""
         with self._lock:
             if self._running:
                 logger.debug("Stopping image loader")
                 self._running = False
                 
-                # 1. Send termination signal
-                self.load_queue.put(("TERMINATE", None, None))
+                # Clear the queue first
+                while not self.load_queue.empty():
+                    try:
+                        self.load_queue.get_nowait()
+                        self.load_queue.task_done()
+                    except queue.Empty:
+                        break
                 
-                # 2. Shutdown executor with force
-                self.executor.shutdown(wait=False, cancel_futures=True)
+                # Send termination signal
+                self.load_queue.put(("TERMINATE", None, None, None))
                 
-                # 3. Join thread with timeout
-                if self.worker_thread:
-                    self.worker_thread.join(timeout=0.5)
-                    if self.worker_thread.is_alive():
-                        logger.warning("Forcing thread termination")
-                        del self.worker_thread
+                # Shutdown executor
+                try:
+                    self.executor.shutdown(wait=False, cancel_futures=True)
+                    # Create a new executor for future use
+                    self.executor = ThreadPoolExecutor(max_workers=2)
+                except Exception as e:
+                    logger.exception(f"Error shutting down executor: {str(e)}")
                 
-                logger.info("Image loader fully stopped")
-
+                # Wait for thread to terminate
+                if self.worker_thread and self.worker_thread.is_alive():
+                    try:
+                        self.worker_thread.join(timeout=1.0)
+                        if self.worker_thread.is_alive():
+                            logger.warning("Thread still alive after timeout")
+                    except RuntimeError as e:
+                        logger.error(f"Error joining thread: {e}")
+                
+                # Clear active tasks
+                self.active_tasks.clear()
+                logger.debug("Image loader stopped")
+    
     def _process_queue(self):
-        """Queue processor with termination handling"""
+        """Process the image loading queue with auto-timeout"""
+        idle_start = None
+        max_idle_seconds = 10
+        
         while self._running:
             try:
-                task = self.load_queue.get(timeout=0.1)
-                if task[0] == "TERMINATE":  # Termination signal
+                # Use a short timeout to check for idle state
+                task = self.load_queue.get(timeout=0.5)
+                
+                # Reset idle tracking when a task is found
+                idle_start = None
+                
+                # Check for termination signal
+                if task[0] == "TERMINATE":
                     break
-                self._load_single_image(*task)
+                    
+                # Process the task
+                image_path, size, callback, task_id = task
+                self._load_single_image(image_path, size, callback, task_id)
                 self.load_queue.task_done()
+                
             except queue.Empty:
-                continue
+                # Track idle time
+                if idle_start is None:
+                    idle_start = time.time()
+                
+                # Auto-stop if idle for too long with no active tasks
+                if idle_start and (time.time() - idle_start > max_idle_seconds) and not self.active_tasks:
+                    with self._lock:
+                        logger.debug("Image loader idle timeout, pausing")
+                        self._running = False
+                    break
+                
             except Exception as e:
-                logger.error(f"Queue error: {str(e)}")
-        logger.debug("Process queue exited")        
+                logger.exception(f"Queue error: {str(e)}")
         
-    def load_image(self, image_path, size, callback):
-        """Add load task to queue with parent check"""
-        if not self.parent.winfo_exists():  # Critical check
-            return        
-        if self._running and self.parent.winfo_exists():
-            self.load_queue.put((image_path, size, callback))
-                
-    def _load_single_image(self, image_path, size, callback):
+        logger.debug("Image loader queue processor exited")
+    
+    def load_image(self, image_path, size, callback, category=None):
+        """Add an image loading task to the queue"""
+        # Check if parent widget still exists
+        if not self.parent.winfo_exists():
+            return None
+        
+        # Generate a unique task ID
+        task_id = str(uuid.uuid4())
+        
+        # Wrap callback for task tracking
+        def task_complete_callback(photo):
+            try:
+                # Ensure parent exists before callback
+                if self.parent.winfo_exists():
+                    callback(photo)
+            except Exception as e:
+                logger.exception(f"Callback error: {e}")
+            finally:
+                # Clean up task tracking
+                with self._lock:
+                    if task_id in self.active_tasks:
+                        self.active_tasks.remove(task_id)
+        
+        # Add to active tasks
+        with self._lock:
+            if len(self.active_tasks) >= self.max_concurrent_tasks:
+                logger.warning(f"Too many active tasks ({len(self.active_tasks)}), dropping: {image_path}")
+                return None
+            self.active_tasks.add(task_id)
+        
+        # Check for cached image
+        cached_image = self.image_cache.get(image_path)
+        if cached_image:
+            # Use cached image and run callback directly
+            self.parent.after(0, lambda: task_complete_callback(cached_image))
+            return task_id
+        
+        # Add image loading task to queue
+        if self.parent.winfo_exists():
+            self.load_queue.put((image_path, size, task_complete_callback, task_id))
+            
+            # Ensure worker is running
+            if not self._running:
+                self.start()
+        
+        return task_id
+    
+    def cancel_task(self, task_id):
+        """Cancel a pending task if possible"""
+        with self._lock:
+            if task_id in self.active_tasks:
+                self.active_tasks.remove(task_id)
+                return True
+        return False
+    
+    def _load_single_image(self, image_path, size, callback, task_id):
+        """Load a single image with error handling"""
+        if task_id not in self.active_tasks:
+            # Task was cancelled
+            return
+            
         try:
-            cached_image = self.image_cache.get(image_path)
-            if cached_image:
-                callback(cached_image)
-                return
-                
+            # Attempt to load image
             image = Image.open(image_path)
             if size:
                 image.thumbnail(size)
-            photo = ctk.CTkImage(image, size=image.size)
-            if photo:
-                # Check if the application still exists
-                if self._running and not self.parent.winfo_exists():
-                    return
-                callback(photo)
-            else:
-                callback(None)
-        except Exception as e:
-            logger.error(f"Image load failed: {str(e)}")
-            callback(None)
             
+            # Convert to CTkImage
+            photo = ctk.CTkImage(image, size=image.size)
+            
+            # Cache the image
+            self.image_cache.put(image_path, photo)
+            
+            # Ensure parent widget still exists
+            if not self.parent.winfo_exists():
+                return
+                
+            # Execute callback on main thread
+            self.parent.after(0, lambda: callback(photo))
+            
+        except Exception as e:
+            logger.exception(f"Image load failed: {str(e)}")
+            # Execute callback with None to indicate failure
+            if self.parent.winfo_exists():
+                self.parent.after(0, lambda: callback(None))
+    
     def clear_category(self, category: str):
         """Clear cached images for a category"""
         self.image_cache.remove_category(category)
+    
+    def __del__(self):
+        """Clean up resources when object is garbage collected"""
+        try:
+            self.stop()
+        except Exception as e:
+            logger.exception(f"Error in __del__: {e}")
+        
+        # Remove from class instances
+        for parent_id, instance in list(self._instances.items()):
+            if instance is self:
+                del self._instances[parent_id]
+                break
 
 class CategoryView(ctk.CTkFrame):
     def __init__(self, parent, category: str, base_path: str, update_callback, get_preview_image, main_app,**kwargs):
@@ -406,7 +586,7 @@ class CategoryView(ctk.CTkFrame):
 
         self.category = category
         self.base_path = base_path
-        self.image_loader = AsyncImageLoader(parent=self)
+        self.image_loader = AsyncImageLoader.get_instance(self)
         self.update_callback = update_callback
         self.get_preview_image = get_preview_image
         self.items_loaded = False
@@ -487,12 +667,17 @@ class CategoryView(ctk.CTkFrame):
         # Clear existing items
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
-            
+
+        # Calculate start and end indices
         start_idx = self.current_page * self.items_per_page
         end_idx = min(start_idx + self.items_per_page, len(self.all_items))
-        
+
+        # Load items for the current page
         for item in self.all_items[start_idx:end_idx]:
             self.create_item_widget(item)
+
+        # Update navigation buttons
+        self.update_navigation()
             
     def create_item_widget(self, item_name: str):
         """Create widget for a single item"""
@@ -588,12 +773,12 @@ class CategoryView(ctk.CTkFrame):
     def add_texture(self, item_name: str, texture: str):
         valid_prefix = CATEGORY_PREFIXES.get(self.category)
         if not texture.startswith(valid_prefix):
-            logger.error(f"Invalid texture {texture} for category {self.category}")
+            logger.exception(f"Invalid texture {texture} for category {self.category}")
             return        
         if item_name not in self.item_textures:
             self.item_textures[item_name] = []
         if texture not in self.item_textures[item_name]:
-            logger.debug(f"Adding texture {texture} to item {item_name} in category {self.category}")
+            logger.info(f"Adding texture {texture} to item {item_name} in category {self.category}")
             self.item_textures[item_name].append(texture)
             logger.info(f"Added texture. {texture} in {item_name}")
             self._save_current_state()
@@ -640,15 +825,15 @@ class CategoryView(ctk.CTkFrame):
         # Always use ground truth from main app
         texture_category = f"{self.category}_textures"
         current_textures = self.main_app.updated_dictionary.get(texture_category, {}).get(item_name, [])
-        logger.debug(f"Current verified textures for {item_name}: {current_textures}")
+        logger.info(f"Current verified textures for {item_name}: {current_textures}")
 
         # Nuclear clear of existing widgets
         for widget in display_frame.winfo_children():
-            logger.debug(f"Destroying widget: {type(widget).__name__}")
+            logger.info(f"Destroying widget: {type(widget).__name__}")
             widget.destroy()
 
         if not current_textures:
-            logger.info("No textures - showing empty state")
+            logger.error("No textures - showing empty state")
             ctk.CTkLabel(display_frame, text="No textures selected",height=100).pack()
             return
 
@@ -658,7 +843,7 @@ class CategoryView(ctk.CTkFrame):
         size = size_map.get(num_textures, 65)
         items_per_row = min(num_textures, 4 if size == 65 else num_textures)
         
-        logger.debug(f"Rendering {num_textures} texture(s) at {size}px")
+        logger.info(f"Rendering {num_textures} texture(s) at {size}px")
 
         # Grid layout rebuild
         row = col = 0
@@ -710,40 +895,37 @@ class CategoryView(ctk.CTkFrame):
                 
     def prev_page(self):
         """Save current page state before navigation"""
-        self._save_current_state()
+        self._save_current_state()  # Save selections before switching pages
         if self.current_page > 0:
             self.current_page -= 1
             self.load_current_page()
             self.update_navigation()
+            # Scroll to the top of the page
+            self.scrollable_frame._parent_canvas.yview_moveto(0.0)  # Reset scroll position to top
 
     def next_page(self):
         """Save current page state before navigation"""
-        self._save_current_state()
+        self._save_current_state()  # Save selections before switching pages
         total_pages = (len(self.all_items) + self.items_per_page - 1) // self.items_per_page
         if self.current_page < total_pages - 1:
             self.current_page += 1
             self.load_current_page()
             self.update_navigation()
+            # Scroll to the top of the page
+            self.scrollable_frame._parent_canvas.yview_moveto(0.0)  # Reset scroll position to top
 
     def _save_current_state(self):
         """Persist current selections to main app's state"""
         texture_category = f"{self.category}_textures"
-        logger.debug(f"Saving state for {texture_category}: {self.item_textures}")
+        logger.info(f"Saving state for {texture_category}: {self.item_textures}")
         # Update main app's dictionary with deep copy
         self.main_app.updated_dictionary[texture_category] = {
             item: textures.copy() 
             for item, textures in self.item_textures.items()
             if textures
         }
-        logger.debug(f"Saved state for {texture_category}")
+        logger.info(f"Saved state for {texture_category}")
 
-    def update_selection_state(self, item_name: str, selected: bool):
-        """Handle item selection with checkbox sync"""
-        super().update_selection_state(item_name, selected)  # Keep existing logic
-        
-        # Notify main app to sync checkboxes
-        self.main_app._sync_checkbox_states()
-        self.main_app.update_texture_display()
 
     def cleanup(self):
         """Nuclear cleanup for category view"""
@@ -759,11 +941,467 @@ class CategoryView(ctk.CTkFrame):
         # 3. Clear references
         self.master = None
         self.image_loader = None
-        logger.debug(f"{self.category} view resources released")
+        logger.info(f"{self.category} view resources released")
+
+class SpecialSelectionWindow(ctk.CTkToplevel):
+    def __init__(self, parent, categories: List[str], option_name: str, update_callback, get_preview_image, image_loader, checkboxes, updated_dictionary):
+        super().__init__(parent)
+        self.parent = parent  # Store the parent reference
+        self.title(f"Select {option_name}")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.geometry("800x600")
+        self.option_name = option_name
+        self.categories = categories
+        self.update_callback = update_callback
+        self.get_preview_image = get_preview_image
+        self.image_loader = image_loader
+        self.category_view = None
+        self.checkboxes = checkboxes
+        self.updated_dictionary = updated_dictionary  # Store the updated_dictionary
+
+        # Determine the base path
+        if option_name == "head":
+            self.base_path = os.path.join(os.path.dirname(MALE_PATH), "face")  # Outside MALE_PATH/FEMALE_PATH
+        else:
+            self.base_path = os.path.join(MALE_PATH if parent.gender_var.get() == "male" else FEMALE_PATH, "body")
+
+        # Log the base path
+        logger.info(f"Base path for {option_name}: {self.base_path}")
+
+        # Initialize state
+        self.current_page = 0
+        self.items_per_page = 10
+        self.all_items = None
+        self.selected_model = None
+        self.selected_texture = None
+
+        # Create UI components
+        self.create_ui()
+
+        # Load existing selections
+        self.load_existing_selections()
+
+    def create_ui(self):
+        """Create the UI for selecting models and textures."""
+        # Category buttons frame at the top
+        self.buttons_frame = ctk.CTkFrame(self)
+        self.buttons_frame.pack(fill="x", padx=10, pady=5)
+
+        # Add buttons for model and texture selection
+        self.model_button = ctk.CTkButton(
+            self.buttons_frame,
+            text="Model",
+            command=lambda: self.show_category("model"),
+            fg_color=PURPLE,
+            hover_color=HOVER_PURPLE,
+            width=100
+        )
+        self.model_button.pack(side="left", padx=5)
+
+        self.texture_button = ctk.CTkButton(
+            self.buttons_frame,
+            text="Texture",
+            command=lambda: self.show_category("texture"),
+            fg_color=PURPLE,
+            hover_color=HOVER_PURPLE,
+            width=100
+        )
+        self.texture_button.pack(side="left", padx=5)
+
+        # Scrollable frame for items
+        self.scrollable_frame = ctk.CTkScrollableFrame(self)
+        self.scrollable_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # Navigation frame at the bottom
+        self.nav_frame = ctk.CTkFrame(self)
+        self.nav_frame.pack(fill="x", padx=10, pady=5)
+
+        # Previous button
+        self.prev_button = ctk.CTkButton(
+            self.nav_frame,
+            text="Previous",
+            width=100,
+            command=self.prev_page,
+            fg_color=PURPLE,
+            hover_color=HOVER_PURPLE
+        )
+        self.prev_button.pack(side="left", padx=5)
+
+        # Next button
+        self.next_button = ctk.CTkButton(
+            self.nav_frame,
+            text="Next",
+            width=100,
+            command=self.next_page,
+            fg_color=PURPLE,
+            hover_color=HOVER_PURPLE
+        )
+        self.next_button.pack(side="right", padx=5)
+
+        # Page label
+        self.page_label = ctk.CTkLabel(self.nav_frame, text="Page 1")
+        self.page_label.pack(side="left", padx=5)
+
+        # Load the first page (models by default)
+        self.show_category("model")
+
+    def get_models(self):
+        """Get available models."""
+        model_path = os.path.join(self.base_path, "model")
+        
+        # Check if the model path exists
+        if not os.path.exists(model_path):
+            create_message_box("error", "Models do not exist...", 5000)
+            logger.error(f"There are no models in {model_path}")
+            return []
+        
+        # Get all subdirectories in the model folder
+        models = sorted(
+            [item for item in os.listdir(model_path) if os.path.isdir(os.path.join(model_path, item))],
+            key=lambda x: int(x) if x.isdigit() else float('inf')
+        )
+        
+        return models
+
+    def get_textures(self):
+        """Get available textures."""
+        texture_path = os.path.join(self.base_path, "textures")
+        
+        # Check if the texture path exists
+        if not os.path.exists(texture_path):
+            logger.error(f"Texture path does not exist: {texture_path}")
+            return []
+        
+        # Get all PNG files in the texture folder
+        textures = sorted(
+            [item for item in os.listdir(texture_path) if os.path.isdir(os.path.join(texture_path, item))],
+            key=lambda x: int(x) if x.isdigit() else float('inf')
+        )
+        
+        return textures
+
+    def show_category(self, category: str):
+        """Switch between model and texture selection."""
+        self.current_category = category
+        self.current_page = 0
+
+        if category == "model":
+            # Load models
+            self.all_items = self.get_models()
+            self.load_current_page()
+        elif category == "texture":
+            # Check if at least one model is selected
+            if self.option_name in self.updated_dictionary and self.updated_dictionary[self.option_name]:
+                # Load textures
+                self.all_items = self.get_textures()
+                self.load_current_page()
+            else:
+                # Show error message if no model is selected
+                create_message_box("Error", "Please Select At Least One Model First.", 4000)
+        else:
+            logger.error("Wrong category in show_category")      
+
+    def load_existing_selections(self):
+        """Load existing selections from the parent's state."""
+        if self.option_name in self.parent.updated_dictionary:
+            # Load the selected model
+            self.selected_model = self.parent.updated_dictionary[self.option_name][0] if self.parent.updated_dictionary[self.option_name] else None
+
+            # Load the selected texture and texture file name
+            if f"{self.option_name}_textures" in self.parent.updated_dictionary:
+                texture_data = self.parent.updated_dictionary[f"{self.option_name}_textures"]
+                if texture_data:
+                    # Extract the texture and texture file name
+                    self.selected_texture = list(texture_data.keys())[0]  # The texture key (e.g., "head_diff_001_a_whi.png")
+                    self.texture_file_name = texture_data[self.selected_texture][0]  # The texture file name (e.g., "head_diff_001_a_whi.png")
+                else:
+                    self.selected_texture = None
+                    self.texture_file_name = None
+            else:
+                self.selected_texture = None
+                self.texture_file_name = None
+
+        # Update UI to reflect existing selections
+        if self.selected_model:
+            self.show_category("texture")
+            if self.selected_texture and self.texture_file_name:
+                self.update_callback(self.option_name, self.selected_model, self.selected_texture, self.texture_file_name, True)
+                
+    def load_current_page(self):
+        """Load items for the current page."""
+        # Clear existing items
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        # Calculate start and end indices
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.all_items))
+
+        # Load items for the current page
+        for item in self.all_items[start_idx:end_idx]:
+            self.create_item_widget(item)
+
+        # Restore the selected state for models
+        if self.current_category == "model":
+            if self.option_name in self.updated_dictionary:
+                selected_models = self.updated_dictionary[self.option_name]
+                for widget in self.scrollable_frame.winfo_children():
+                    if isinstance(widget, ctk.CTkFrame):
+                        checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                        item_name = checkbox._text.split()[-1]  # Extract model name
+                        if item_name in selected_models:
+                            checkbox.select()  # Check the checkbox for selected models
+
+        # Update navigation buttons
+        self.update_navigation()
+
+    def create_item_widget(self, item):
+        """Create a widget for a single item."""
+        frame = ctk.CTkFrame(self.scrollable_frame)
+        frame.pack(fill="x", padx=10, pady=5)
+
+        # Checkbox for selecting the item
+        var = ctk.BooleanVar()
+        checkbox = ctk.CTkCheckBox(
+            frame,
+            text=f"{self.current_category.capitalize()} {item}",
+            variable=var,
+            fg_color=PURPLE,
+            hover_color=HOVER_PURPLE,
+            command=lambda i=item: self.select_item(i, var.get())
+        )
+        checkbox.pack(side="left", padx=5)
+
+        # Preview image
+        preview_label = ctk.CTkLabel(frame, width=100, height=100, text="")
+        preview_label.pack(side="left", padx=5)
+
+        # Load preview image
+        if self.option_name == "head":
+            if self.current_category == "model":
+                preview_path = os.path.join(self.base_path, "model", item, f"head_{int(item):03d}_r.png")
+            else:
+                # For textures, the item is the filename (e.g., head_diff_000_a_whi.png)
+                preview_path = os.path.join(self.base_path, "textures", item, f"head_diff_{int(item):03d}_a_whi.png")
+        else:
+            if self.current_category == "model":
+                preview_path = os.path.join(self.base_path, "model", item, f"uppr_{int(item):03d}_r.png")
+            else:
+                # For textures, the item is the filename (e.g., head_diff_000_a_whi.png)
+                preview_path = os.path.join(self.base_path, "textures", item, f"uppr_diff_{int(item):03d}_a_whi.png") 
+
+        if os.path.exists(preview_path):
+            # Use the image loader to load the image asynchronously
+            self.image_loader.load_image(
+                preview_path,
+                (100, 100),
+                lambda photo: self.after(0, self._update_preview_label, preview_label, photo)
+            )
+        else:
+            logger.warning(f"Preview image not found for {self.current_category} {item}")
+
+    def select_item(self, item, selected):
+        """Handle item selection."""
+        if selected:
+            if self.option_name == "head":
+                if self.current_category == "model":
+                    # Add the selected model to the list
+                    if self.option_name not in self.updated_dictionary:
+                        self.updated_dictionary[self.option_name] = []
+                    if item not in self.updated_dictionary[self.option_name]:
+                        self.updated_dictionary[self.option_name].append(item)
+                        logger.info(f"Added model {item} to {self.option_name} in updated_dictionary")
+                    self.update_callback(self.option_name, item, None, None, True)
+                    self.show_category("texture")  # Automatically switch to texture selection
+                elif self.current_category == "texture":
+                    # Uncheck all other textures
+                    self._uncheck_all_textures()
+                    
+                    # Update the selected texture
+                    self.selected_texture = item
+                    
+                    # Check the checkbox for the newly selected texture
+                    self._check_selected_texture(item)
+                    
+                    # Get the actual texture file name
+                    texture_path = os.path.join(self.base_path, "textures", item)
+                    texture_files = [f for f in os.listdir(texture_path) if f.endswith('.png')]
+                    if texture_files:
+                        texture_name = texture_files[0]  # Assuming the first texture file is the one we want
+                        # Save the selection immediately using the parent's update_selection method
+                        self.update_callback(self.option_name, self.selected_model, self.selected_texture, texture_name, True)
+                        logger.info(f"Added texture {texture_name} to {self.option_name}_textures in updated_dictionary")
+            elif self.option_name == "body":
+                if self.current_category == "model":
+                    # Add the selected model to the list
+                    if self.option_name not in self.updated_dictionary:
+                        self.updated_dictionary[self.option_name] = []
+                    if item not in self.updated_dictionary[self.option_name]:
+                        self.updated_dictionary[self.option_name].append(item)
+                        logger.info(f"Added model {item} to {self.option_name} in updated_dictionary")
+                    self.update_callback(self.option_name, item, None, None, True)
+                elif self.current_category == "texture":
+                    # Uncheck all other textures
+                    self._uncheck_all_textures()
+                    
+                    # Update the selected texture
+                    self.selected_texture = item
+                    
+                    # Check the checkbox for the newly selected texture
+                    self._check_selected_texture(item)
+                    
+                    # Get the actual texture file name
+                    texture_path = os.path.join(self.base_path, "textures", item)
+                    texture_files = [f for f in os.listdir(texture_path) if f.endswith('.png')]
+                    if texture_files:
+                        texture_name = texture_files[0]  # Assuming the first texture file is the one we want
+                        # Save the selection immediately using the parent's update_selection method
+                        self.update_callback(self.option_name, self.selected_model, self.selected_texture, texture_name, True)
+                        logger.info(f"Added texture {texture_name} to {self.option_name}_textures in updated_dictionary")
+        else:
+            # Handle deselection
+            if self.current_category == "model":
+                # Remove the deselected model from the list
+                if self.option_name in self.updated_dictionary and item in self.updated_dictionary[self.option_name]:
+                    self.updated_dictionary[self.option_name].remove(item)
+                    logger.info(f"Removed model {item} from {self.option_name} in updated_dictionary")
+                self.update_callback(self.option_name, item, None, None, False)  # Clear model selection
+            elif self.current_category == "texture":
+                self.selected_texture = None
+                self.update_callback(self.option_name, self.selected_model, None, None, False)  # Clear texture selection
+                logger.info(f"Removed texture from {self.option_name}_textures in updated_dictionary")
+
+        # Save the current selections when an item is selected or deselected
+        self._save_selections()
+
+    def update_navigation(self):
+        """Update navigation buttons and page label."""
+        total_pages = (len(self.all_items) + self.items_per_page - 1) // self.items_per_page
+        self.prev_button.configure(state="normal" if self.current_page > 0 else "disabled")
+        self.next_button.configure(state="normal" if self.current_page < total_pages - 1 else "disabled")
+        self.page_label.configure(text=f"Page {self.current_page + 1} of {total_pages}")
+
+    def prev_page(self):
+        """Go to the previous page."""
+        if self.current_page > 0:
+            # Save the current selections before switching pages
+            self._save_selections()
+            self.current_page -= 1
+            self.load_current_page()
+            # Scroll to the top of the page
+            self.scrollable_frame._parent_canvas.yview_moveto(0.0)  # Reset scroll position to top
+
+    def next_page(self):
+        """Go to the next page."""
+        total_pages = (len(self.all_items) + self.items_per_page - 1) // self.items_per_page
+        if self.current_page < total_pages - 1:
+            # Save the current selections before switching pages
+            self._save_selections()
+            self.current_page += 1
+            self.load_current_page()
+            # Scroll to the top of the page
+            self.scrollable_frame._parent_canvas.yview_moveto(0.0)  # Reset scroll position to top
+
+    def _update_preview_label(self, label, photo):
+        """Update the preview label with the loaded image."""
+        if label.winfo_exists():
+            label.configure(image=photo, text="")
+
+    def _check_selected_texture(self, texture):
+        """Check the checkbox for the selected texture."""
+        for widget in self.scrollable_frame.winfo_children():
+            if isinstance(widget, ctk.CTkFrame):
+                checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                if checkbox._text.split()[-1] == texture:  # Match the texture name
+                    checkbox.select()  # Check the checkbox
+                    break
+
+    def _uncheck_all_textures(self):
+        """Uncheck all texture checkboxes."""
+        for widget in self.scrollable_frame.winfo_children():
+            if isinstance(widget, ctk.CTkFrame):
+                checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                checkbox.deselect()  # Uncheck the checkbox
+
+    def _save_selections(self):
+        """Save the currently selected models and textures."""
+        if self.current_category == "model":
+            # Save all selected models
+            selected_models = []
+            for widget in self.scrollable_frame.winfo_children():
+                if isinstance(widget, ctk.CTkFrame):
+                    checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                    if checkbox.get():
+                        selected_models.append(checkbox._text.split()[-1])  # Extract model name
+            
+            # Append to the existing list of selected models
+            if self.option_name not in self.updated_dictionary:
+                self.updated_dictionary[self.option_name] = []
+            self.updated_dictionary[self.option_name] = list(set(self.updated_dictionary[self.option_name] + selected_models))
+            logger.info(f"Saved models for {self.option_name}: {self.updated_dictionary[self.option_name]}")
+        elif self.current_category == "texture":
+            # Save the selected texture
+            for widget in self.scrollable_frame.winfo_children():
+                if isinstance(widget, ctk.CTkFrame):
+                    checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                    if checkbox.get():
+                        self.selected_texture = checkbox._text.split()[-1]  # Extract texture name
+                        break
+            if self.selected_texture:
+                texture_category = f"{self.option_name}_textures"
+                if texture_category not in self.updated_dictionary:
+                    self.updated_dictionary[texture_category] = {}
+                texture_path = os.path.join(self.base_path, "textures", self.selected_texture)
+                texture_files = [f for f in os.listdir(texture_path) if f.endswith('.png')]
+                if texture_files:
+                    texture_name = texture_files[0]  # Assuming the first texture file is the one we want
+                    self.updated_dictionary[texture_category][self.selected_texture] = [texture_name]
+                    logger.info(f"Saved texture for {self.option_name}: {texture_name}")
+
+    def _restore_selections(self):
+        """Restore the selected state for items that were previously selected."""
+        if self.current_category == "model" and self.selected_model:
+            # Restore the selected model
+            for widget in self.scrollable_frame.winfo_children():
+                if isinstance(widget, ctk.CTkFrame):
+                    checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                    if checkbox._text.split()[-1] == self.selected_model:
+                        checkbox.select()  # Select the checkbox
+                        break
+        elif self.current_category == "texture" and self.selected_texture:
+            # Restore the selected texture
+            for widget in self.scrollable_frame.winfo_children():
+                if isinstance(widget, ctk.CTkFrame):
+                    checkbox = widget.winfo_children()[0]  # First child is the checkbox
+                    if checkbox._text.split()[-1] == self.selected_texture:
+                        checkbox.select()  # Select the checkbox
+                        break
+
+    def _on_close(self):
+        """Safe window closure with state saving."""
+        logger.info(f"Closing {self.option_name} window")
+        
+        # Save the selected model and texture
+        if self.selected_model and self.selected_texture:
+            self.update_callback(self.option_name, self.selected_model, self.selected_texture, True)
+        
+        # 1. Stop all image loaders
+        if hasattr(self, 'category_view'):
+            if self.category_view:
+                self.category_view.cleanup()
+        
+        # 2. Remove from window registry
+        if self.option_name in self.parent.selection_windows:
+            del self.parent.selection_windows[self.option_name]
+        
+        # 3. Delay destruction for thread cleanup
+        self.after(100, self.destroy)
+        logger.info("Window closure processed")
+        
 
 class ClothesSelectionWindow(ctk.CTkToplevel):
     def __init__(self, parent, categories: List[str], base_path: str,
-                 update_callback, get_preview_image, image_loader,**kwargs):
+                 update_callback, get_preview_image, option_name ,image_loader,**kwargs):
         super().__init__(parent)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Add these new properties
@@ -779,6 +1417,7 @@ class ClothesSelectionWindow(ctk.CTkToplevel):
         self.base_path = base_path
         self.update_callback = update_callback
         self.get_preview_image = get_preview_image  # Store the method
+        self.option_name = option_name
         self.current_category = None
         self.category_view = None
         
@@ -855,23 +1494,27 @@ class ClothesSelectionWindow(ctk.CTkToplevel):
         
         # 3. Delay destruction for thread cleanup
         self.after(100, self.destroy)
-        logger.debug("Window closure processed")
+        logger.info("Window closure processed")
 
 class PedCreatorGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self._is_destroyed = False
-        self.image_loader = AsyncImageLoader(parent=self)
+        self.image_loader = AsyncImageLoader.get_instance(self)
         self.protocol("WM_DELETE_WINDOW", self._safe_destroy)
 
         # Basic window setup
         self.title(f"FiveM Ped Creator - Made By Fucking ! Lucas.exe™")
-        self.iconbitmap("icon.ico")
+        self.iconbitmap("images\icon.png") #TODO: fix the icon
         self.geometry("1000x700")
         self.resizable(False, False)
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
         ctk.set_appearance_mode("dark")
+
+        # Explicitly set the logging level for your logger
+        logger.setLevel(logging.DEBUG)
+
 
         # Initialize state dictionary with all categories
         self.updated_dictionary = {
@@ -891,7 +1534,7 @@ class PedCreatorGUI(ctk.CTk):
             "vests": [],
             "watches": [],
             "hands": [],
-            "face": [],
+            "head": [],
             "body": [],
             # Initialize texture categories
             "accs_textures": {},
@@ -909,7 +1552,7 @@ class PedCreatorGUI(ctk.CTk):
             "vests_textures": {},
             "watches_textures": {},
             "hands_textures": {},
-            "face_textures": {},
+            "head_textures": {},
             "body_textures": {}
         }
         
@@ -918,7 +1561,7 @@ class PedCreatorGUI(ctk.CTk):
         
         self.clothes_path = MALE_PATH
         self.font = "Supernova"
-        self.iconpath = "icon.png"
+        self.iconpath = "images/icon.png"
         
         # Dictionary to store selection windows
         self.selection_windows = {}
@@ -939,6 +1582,30 @@ class PedCreatorGUI(ctk.CTk):
                 return os.path.join(preview_path, files[0])
         return None
 
+    def open_special_selection(self, option_name: str, categories: List[str]):
+        """Open a special selection window for Head and Body categories."""
+        logger.info(f"Opening special selection window for {option_name}")
+        
+        if option_name in self.selection_windows:
+            self.selection_windows[option_name].lift()
+            return
+
+        window = SpecialSelectionWindow(
+            self,  # Pass the parent reference (PedCreatorGUI instance)
+            categories,  # Categories (e.g., ["model", "texture"])
+            option_name,  # Option name (e.g., "Head" or "Body")
+            self.update_special_selection,  # Update callback method
+            self.get_preview_image,  # Method to get preview images
+            self.image_loader,  # Async image loader
+            self.checkboxes,  # Checkboxes dictionary
+            self.updated_dictionary  # Pass the updated_dictionary
+        )
+        window.transient(self)
+        window.grab_set()
+        self.selection_windows[option_name] = window
+
+        window.protocol("WM_DELETE_WINDOW", lambda: self.on_special_selection_window_close(option_name)) 
+
     def open_clothes_selection(self, option_name: str, categories: List[str]):
         """Open a new window for clothes selection with dynamic loading"""
         if option_name in self.selection_windows:
@@ -946,11 +1613,12 @@ class PedCreatorGUI(ctk.CTk):
             return
             
         window = ClothesSelectionWindow(
-            self,  # <-- Changed from parent=self to pass main app reference
+            self, 
             categories,
             self.clothes_path,
             self.update_selection,
             self.get_preview_image,
+            option_name,
             self.image_loader
         )
         window.transient(self)
@@ -960,31 +1628,34 @@ class PedCreatorGUI(ctk.CTk):
         window.protocol("WM_DELETE_WINDOW", lambda: self.on_selection_window_close(option_name))
 
     def create_option_checkboxes(self):
-        """Create checkboxes for all ped options with associated category mappings"""
+        """Create checkboxes for all ped options with associated category mappings."""
         options = [
-            ("Hands", 85, 150, ["hands"]),
-            ("Head", 286, 150, ["model","texture"]),
-            ("Hair", 85, 195, ["hairs"]),
-            ("Body", 286, 195, ["model","texture"]),
-            ("Accessories", 85, 240, ["accs", "bags", "chains", "glasses", "hats", "masks", "watches"]),
-            ("Clothes", 286, 240, ["shirts", "pants", "shoes", "under_shirt", "vests", "decals"])
+            ("head", 85, 150, ["model", "texture"], True),  # True indicates special handling
+            ("hair", 286, 150, ["hairs"], False),  # False indicates not special handling
+            ("body", 85, 195, ["model", "texture"], True),  # True indicates special handling
+            ("accessories", 286, 195, ["accs", "bags", "chains", "glasses", "hats", "masks", "watches"], False),  # False indicates not special handling
+            ("clothes", 85, 240, ["shirts", "pants", "shoes", "under_shirt", "vests", "decals"], False)  # False indicates not special handling
         ]
 
         self.checkboxes = {}
-        for text, x, y, categories in options:
+        for text, x, y, categories, special in options:
             frame = ctk.CTkFrame(self.builder_frame)
             frame.grid(row=1, column=0, sticky="nw", padx=x, pady=y)
-            
+
+            # Create a BooleanVar to track the checkbox state
+            var = ctk.BooleanVar()
+
             checkbox = ctk.CTkCheckBox(
                 frame,
-                text=text,
+                text=text.capitalize(),
                 font=ctk.CTkFont(size=17, family=self.font),
                 fg_color=PURPLE,
                 hover_color=HOVER_PURPLE,
+                variable=var,  # Link the checkbox to the BooleanVar
                 command=lambda t=text, cats=categories: self.on_checkbox_click(t, cats)
             )
             checkbox.pack(side='left', padx=5)
-            
+
             edit_button = ctk.CTkButton(
                 frame,
                 text="Edit",
@@ -992,15 +1663,16 @@ class PedCreatorGUI(ctk.CTk):
                 width=60,
                 fg_color=PURPLE,
                 hover_color=HOVER_PURPLE,
-                command=lambda t=text, cats=categories: self.edit_selections(t, cats)
+                command=lambda t=text, cats=categories, special=special: self.edit_selections(t, cats, special)
             )
             edit_button.pack(side='left', padx=5)
             edit_button.configure(state='disabled')
-            
+
             self.checkboxes[text] = {
                 "checkbox": checkbox,
                 "categories": categories,
-                "edit_button": edit_button
+                "edit_button": edit_button,
+                "var": var  # Store the BooleanVar for later use
             }
 
     def create_clothes_item_widget(self, parent, category: str, item_name: str, item_path: str):
@@ -1062,51 +1734,57 @@ class PedCreatorGUI(ctk.CTk):
             )
             dropdown.pack(side='left', padx=5)
 
-    def edit_selections(self, option_name: str, categories: List[str]):
-        """Handle edit button clicks by opening or focusing the clothes selection window"""
-        self.open_clothes_selection(option_name, categories)
-
+    def edit_selections(self, option_name: str, categories: List[str], is_special: bool = False):
+        if is_special:
+            # Handle Head and Body categories
+            self.open_special_selection(option_name, categories)
+        else:
+            # Handle normal categories
+            self.open_clothes_selection(option_name, categories)
+            
     def on_checkbox_click(self, option_name: str, categories: List[str]):
-        logger.info(f"Checkbox clicked: {option_name} | Categories: {categories}")
-        
+        """Handle checkbox clicks for options."""
         checkbox_info = self.checkboxes[option_name]
         is_checked = checkbox_info["checkbox"].get()
-        logger.debug(f"Checkbox state: {'Checked' if is_checked else 'Unchecked'}")
+        logger.info(f"Checkbox clicked: {option_name} | Checked: {is_checked}")
 
         if is_checked:
-            logger.info(f"Opening selection window for {option_name}")
-            checkbox_info["edit_button"].configure(state='normal')
-            self.open_clothes_selection(option_name, categories)
-        else:
-
-            self.after(500, lambda: self._actually_clear_data(option_name, categories))
-
-            logger.warning(f"Clearing data for categories: {categories}")
-            checkbox_info["edit_button"].configure(state='disabled')
+            # Enable the edit button
+            checkbox_info["edit_button"].configure(state="normal")
             
-            # Clear data and textures
+            # Open the selection window
+            if option_name in ["head", "body"]:
+                # Handle special categories (head, body)
+                self.open_special_selection(option_name, categories)
+            else:
+                # Handle normal categories
+                self.open_clothes_selection(option_name, categories)
+        else:
+            # Disable the edit button
+            checkbox_info["edit_button"].configure(state="disabled")
+            
+            # Clear data and textures for the categories
             for category in categories:
-                logger.debug(f"Resetting {category} and {category}_textures")
+                logger.info(f"Resetting {category} and {category}_textures")
                 self.updated_dictionary[category] = []
                 self.updated_dictionary[f"{category}_textures"] = {}
 
             # Log the updated dictionary state
             logging.debug(f"Updated dictionary after clearing data: {self.updated_dictionary}")
 
-            # Destroy window and force UI refresh
+            # Destroy the selection window if it exists
             if option_name in self.selection_windows:
-                logger.debug(f"Destroying window for {option_name}")
+                logger.info(f"Destroying window for {option_name}")
                 window = self.selection_windows[option_name]
                 window.destroy()
                 del self.selection_windows[option_name]
 
-            # Force refresh of ALL UI components
-            self._sync_checkbox_states()
-            self._refresh_builder_frame()  # New method added below
+        # Sync checkbox states
+        self._sync_checkbox_states()
         
     def _actually_clear_data(self, option_name, categories):
         """Thread-safe data clearance"""
-        logger.debug("Executing safe data clearance")
+        logger.info("Executing safe data clearance")
 
     def refresh_all_textures(self):
         """Force refresh all texture displays"""
@@ -1123,7 +1801,7 @@ class PedCreatorGUI(ctk.CTk):
             if isinstance(child, ctk.CTkFrame):
                 for subchild in child.winfo_children():
                     if isinstance(subchild, ctk.CTkCheckBox):
-                        subchild.configure(text=f"Item {subchild._text.split()[-1]}")
+                        subchild.configure(text=f"{subchild._text.split()[-1]}")
         # Force GUI update
         self.update_idletasks()
 
@@ -1147,30 +1825,49 @@ class PedCreatorGUI(ctk.CTk):
         # Log the updated dictionary state
         logging.debug(f"Updated dictionary after texture change: {self.updated_dictionary}")
 
-    def update_selection(self, category, item_name, selected):
-        """Central state update with texture awareness"""
-        logger.debug(f"Updating selection: category={category}, item_name={item_name}, selected={selected}")
-        if category.endswith("_textures"):
-            base_category = category.replace('_textures', '')
-            if selected is not None:
-                logger.debug(f"Adding texture: {selected} to {category}")
-                self.updated_dictionary[category][item_name] = selected.copy()
-                # Ensure main category has the item
-                if item_name not in self.updated_dictionary[base_category]:
-                    self.updated_dictionary[base_category].append(item_name)
-            else:
-                logger.debug(f"Removing texture: {item_name} from {category}")
-                if item_name in self.updated_dictionary[category]:
-                    del self.updated_dictionary[category][item_name]
+    def update_special_selection(self, category: str, model: str, texture: str | None, texture_name: str | None, selected: bool):
+        """Update selection for special categories (e.g., head, body)."""
+        if selected:
+            # Add the model/texture to the list
+            if category not in self.updated_dictionary:
+                self.updated_dictionary[category] = []
+            if model and model not in self.updated_dictionary[category]:
+                self.updated_dictionary[category].append(model)
+            
+            # Save the texture if provided
+            if texture and texture_name:
+                texture_category = f"{category}_textures"
+                if texture_category not in self.updated_dictionary:
+                    self.updated_dictionary[texture_category] = {}
+                self.updated_dictionary[texture_category][texture] = [texture_name]
         else:
-            # Existing non-texture handling
-            if selected and item_name not in self.updated_dictionary[category]:
-                logger.debug(f"Adding item: {item_name} to {category}")
-                self.updated_dictionary[category].append(item_name)
-            elif not selected and item_name in self.updated_dictionary[category]:
-                logger.debug(f"Removing item: {item_name} from {category}")
-                self.updated_dictionary[category].remove(item_name)
+            # Remove the model/texture from the list
+            if category in self.updated_dictionary and model in self.updated_dictionary[category]:
+                self.updated_dictionary[category].remove(model)
+            
+            # Remove the texture if provided
+            if texture:
+                texture_category = f"{category}_textures"
+                if texture_category in self.updated_dictionary and texture in self.updated_dictionary[texture_category]:
+                    del self.updated_dictionary[texture_category][texture]
+
+        # Log the updated dictionary state
+        logging.debug(f"Updated dictionary after selection change: {self.updated_dictionary}")
+
+        # Sync checkbox states
+        self._sync_checkbox_states()
+
+    def update_selection(self, category, item_name, selected):
+        """Central state update with texture awareness."""
+        logger.debug(f"Updating selection: category={category}, item_name={item_name}, selected={selected}")
         
+        if selected and item_name not in self.updated_dictionary[category]:
+            logger.info(f"Adding item: {item_name} to {category}")
+            self.updated_dictionary[category].append(item_name)
+        elif not selected and item_name in self.updated_dictionary[category]:
+            logger.info(f"Removing item: {item_name} from {category}")
+            self.updated_dictionary[category].remove(item_name)
+     
         # Log the updated dictionary state
         logging.debug(f"Updated dictionary after selection change: {self.updated_dictionary}")
         
@@ -1211,14 +1908,51 @@ class PedCreatorGUI(ctk.CTk):
         # Update checkbox states
         self._update_checkbox_states(option_name)
 
+    def on_special_selection_window_close(self, option_name: str):
+        """Handle window close for special selections (e.g., head, body)."""
+        if option_name in self.selection_windows:
+            selection_window = self.selection_windows[option_name]
+            
+            # Save state before closing
+            if hasattr(selection_window, 'selected_model') and hasattr(selection_window, 'selected_texture'):
+                # Save the selected model and texture
+                if selection_window.selected_model and selection_window.selected_texture:
+                    self.updated_dictionary[option_name] = [selection_window.selected_model]
+                    self.updated_dictionary[f"{option_name}_textures"] = {selection_window.selected_texture: [selection_window.selected_texture]}
+                else:
+                    # Clear the selection if no model or texture is selected
+                    self.updated_dictionary[option_name] = []
+                    self.updated_dictionary[f"{option_name}_textures"] = {}
+
+            # Destroy the window and remove it from the selection_windows dictionary
+            selection_window.destroy()
+            del self.selection_windows[option_name]
+            
+        # Log the updated dictionary state
+        logging.debug(f"Updated dictionary after window close: {self.updated_dictionary}")
+
+        # Update checkbox states
+        self._update_checkbox_states(option_name)
+
     def _update_checkbox_states(self, option_name: str):
-        """Update checkbox states after window closure"""
+        """Update checkbox states after window closure."""
         has_selections = False
-        for category in self.checkboxes[option_name]["categories"]:
-            if self.updated_dictionary.get(category) and len(self.updated_dictionary[category]) > 0:
+
+        # Check if this is a special selection (e.g., head, body)
+        if option_name in ["head", "body"]:
+            # Special handling: both model and texture must be selected
+            if (self.updated_dictionary.get(option_name) and
+                self.updated_dictionary.get(f"{option_name}_textures")):
                 has_selections = True
-                break
-        
+        else:
+            # Normal handling: check if any category has selections
+            for category in self.checkboxes[option_name]["categories"]:
+                if (self.updated_dictionary.get(category) and
+                    len(self.updated_dictionary[category]) > 0):
+                    has_selections = True
+                    break
+
+        # Update checkbox and edit button states
         if not has_selections:
             self.checkboxes[option_name]["checkbox"].deselect()
             self.checkboxes[option_name]["edit_button"].configure(state='disabled')
@@ -1260,22 +1994,41 @@ class PedCreatorGUI(ctk.CTk):
         self.dashboard_button.grid(row=1, column=0, sticky="ew")
 
     def _sync_checkbox_states(self):
-        """Update checkbox states based on actual selections"""
+        """Synchronize checkboxes with the updated_dictionary."""
+        logger.info("Synchronizing checkbox states")
         for option_name, checkbox_info in self.checkboxes.items():
             has_selections = False
-            for category in checkbox_info["categories"]:
-                # Check both items and textures
-                if (self.updated_dictionary.get(category) or 
-                    self.updated_dictionary.get(f"{category}_textures")):
+
+            # Special handling for head and body
+            if option_name in ["head", "body"]:
+                # Check if both model and texture are selected
+                if (self.updated_dictionary.get(option_name) and
+                    self.updated_dictionary.get(f"{option_name}_textures")):
                     has_selections = True
-                    break
-            
-            # Update visual state
+            else:
+                # Normal handling for other categories
+                for category in checkbox_info["categories"]:
+                    if (self.updated_dictionary.get(category) and
+                        len(self.updated_dictionary[category]) > 0):
+                        has_selections = True
+                        break
+
+            # Update checkbox and edit button states
             checkbox = checkbox_info["checkbox"]
-            current_state = checkbox.get()
-            if has_selections != current_state:
-                checkbox.toggle()  # Force state change if mismatch
-            checkbox_info["edit_button"].configure(state="normal" if has_selections else "disabled")
+            edit_button = checkbox_info["edit_button"]
+            var = checkbox_info["var"]  # Get the BooleanVar linked to the checkbox
+
+            if has_selections:
+                var.set(True)  # Set the BooleanVar to True
+                edit_button.configure(state="normal")  # Enable the edit button
+                logger.debug(f"Checkbox for {option_name} is checked, edit button enabled")
+            else:
+                var.set(False)  # Set the BooleanVar to False
+                edit_button.configure(state="disabled")  # Disable the edit button
+                logger.debug(f"Checkbox for {option_name} is unchecked, edit button disabled")
+
+        # Force UI refresh
+        self.update_idletasks()
 
     def setup_builder_frame(self):
         """Setup the main builder frame"""
@@ -1346,6 +2099,7 @@ class PedCreatorGUI(ctk.CTk):
         # Update clothes path based on gender
         self.clothes_path = MALE_PATH if self.gender_var.get() == "male" else FEMALE_PATH
         logger.info(f"Initial clothes path: {self.clothes_path}")   
+
 
     def update_gender(self, *args):
         """Update the clothes path when gender changes"""
@@ -1420,7 +2174,7 @@ class PedCreatorGUI(ctk.CTk):
     def build_ped(self):
         name = self.name_entry.get().strip()
         if not name:
-            self.create_message_box("Error", "Please enter a ped name")
+            create_message_box("Error", "Please enter a ped name", 3000)
             return
             
         # Check if any items are selected
@@ -1441,34 +2195,10 @@ class PedCreatorGUI(ctk.CTk):
                     selected_options[texture_category] = self.updated_dictionary[texture_category]
                         
         if not any_selected:
-            self.create_message_box("Error", "Please select at least one item")
+            create_message_box("Error", "Please select at least one item", 5000)
             return
-                
+                    
         try:
-            import json
-            import os
-            
-            save_path = os.path.join(os.path.dirname(__file__), 'saved_selections.json')
-
-            # Clear all data and prepare new data to save
-            existing_data = {}  # <-- Start with an empty dictionary
-            selected_options["name"] = name
-            existing_data[name] = selected_options  # <-- Add the current ped's data
-
-            # Log the data being saved
-            logging.debug(f"Data being saved: {existing_data}")
-
-            # Atomic write with temporary file
-            temp_path = save_path + ".tmp"
-            with open(temp_path, 'w') as file:
-                json.dump(existing_data, file, indent=4)
-            
-            # Replace original file
-            if os.path.exists(save_path):
-                os.replace(temp_path, save_path)
-            else:
-                os.rename(temp_path, save_path)
-                
             # Show progress window
             progress_window = self.create_progress_window()
             
@@ -1480,60 +2210,34 @@ class PedCreatorGUI(ctk.CTk):
             # Determine base path based on gender
             base_path = MALE_PATH if self.gender_var.get() == "male" else FEMALE_PATH
             
+            # Handle Head and Body separately
+            if "head" in selected_options:
+                # Head is outside MALE_PATH/FEMALE_PATH
+                head_base_path = os.path.join(os.path.dirname(MALE_PATH), "face")
+                FileHandler.copy_files(selected_options, name, head_base_path, progress_callback)
+            if "body" in selected_options:
+                # Body is inside MALE_PATH/FEMALE_PATH
+                body_base_path = os.path.join(base_path, "body")
+                FileHandler.copy_files(selected_options, name, body_base_path, progress_callback)
+            
             # Pass base_path to FileHandler
             FileHandler.copy_files(selected_options, name, base_path, progress_callback)
-                    
+
+            # Generate the YMT XML file
+            selected_options["name"] = name
+            generate_xml(selected_options, name,)  # Pass the selected options and ped name to generate_xml
+            
             # Complete the progress bar
             self.update_progress(progress_window, 1.0, "Complete!")
             self.after(1000, progress_window.destroy)
             
             # Show success message
-            self.create_message_box("success", f"Ped '{name}' has been successfully created!")
+            create_message_box("success", f"Ped '{name}' has been successfully created!",5000)
 
         except Exception as e:
             if 'progress_window' in locals():
                 progress_window.destroy()
-            self.create_message_box("error", f"An error occurred while building the ped:\n{str(e)}")
-
-    def create_message_box(self, message_type, message):
-        """Create a custom message box"""
-        message_box = tk.Toplevel()
-        message_box.overrideredirect(True)
-        message_box.geometry("300x150")
-        
-        # Set the background color based on the message type
-        bg_color = "#d4edda" if message_type == "success" else "#f8d7da"
-        fg_color = "#155724" if message_type == "success" else "#721c24"
-        
-        # Use Canvas for rounded edges
-        canvas = tk.Canvas(message_box, width=300, height=150, bg="white", highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        
-        # Draw rounded rectangle
-        radius = 20
-        canvas.create_arc((0, 0, radius*2, radius*2), start=90, extent=90, fill=bg_color, outline=bg_color)
-        canvas.create_arc((300-radius*2, 0, 300, radius*2), start=0, extent=90, fill=bg_color, outline=bg_color)
-        canvas.create_arc((0, 150-radius*2, radius*2, 150), start=180, extent=90, fill=bg_color, outline=bg_color)
-        canvas.create_arc((300-radius*2, 150-radius*2, 300, 150), start=270, extent=90, fill=bg_color, outline=bg_color)
-        canvas.create_rectangle((radius, 0, 300-radius, 150), fill=bg_color, outline=bg_color)
-        canvas.create_rectangle((0, radius, 300, 150-radius), fill=bg_color, outline=bg_color)
-        
-        # Add the content
-        icon = "✔" if message_type == "success" else "✖"
-        canvas.create_text(150, 50, text=icon, font=("Arial", 24), fill=fg_color)
-        canvas.create_text(150, 90, text=message, font=("Arial", 12), fill=fg_color, width=260)
-        
-        # Add close button
-        close_button = ttk.Button(message_box, text="OK", command=message_box.destroy)
-        close_window_id = canvas.create_window(150, 120, window=close_button)
-        
-        # Center the message box
-        message_box.update_idletasks()
-        screen_width = message_box.winfo_screenwidth()
-        screen_height = message_box.winfo_screenheight()
-        x = (screen_width - message_box.winfo_width()) // 2
-        y = (screen_height - message_box.winfo_height()) // 2
-        message_box.geometry(f"+{x}+{y}")
+            create_message_box("error", f"An error occurred while building the ped:\n{str(e)}", 10000)
 
     def _safe_destroy(self):
         """Proper cleanup sequence"""
@@ -1553,3 +2257,51 @@ class PedCreatorGUI(ctk.CTk):
 
     def destroy(self):
         self._safe_destroy()
+
+def create_message_box(message_type, message, time):
+    """Create a custom message box that disappears after 5 seconds"""
+    message_box = tk.Toplevel()
+    message_box.overrideredirect(True)
+    message_box.geometry("300x150")
+    
+    # Make the window stay on top of all other windows
+    message_box.attributes("-topmost", True)
+    
+    # Set the background color based on the message type
+    bg_color = "#d4edda" if message_type == "success" else "#f8d7da"
+    fg_color = "#155724" if message_type == "success" else "#721c24"
+    
+    # Use Canvas for rounded edges
+    canvas = tk.Canvas(message_box, width=300, height=150, bg=bg_color, highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    
+    # Draw rounded rectangle
+    radius = 20
+    canvas.create_arc((0, 0, radius*2, radius*2), start=90, extent=90, fill=bg_color, outline=bg_color)
+    canvas.create_arc((300-radius*2, 0, 300, radius*2), start=0, extent=90, fill=bg_color, outline=bg_color)
+    canvas.create_arc((0, 150-radius*2, radius*2, 150), start=180, extent=90, fill=bg_color, outline=bg_color)
+    canvas.create_arc((300-radius*2, 150-radius*2, 300, 150), start=270, extent=90, fill=bg_color, outline=bg_color)
+    canvas.create_rectangle((radius, 0, 300-radius, 150), fill=bg_color, outline=bg_color)
+    canvas.create_rectangle((0, radius, 300, 150-radius), fill=bg_color, outline=bg_color)
+    
+    # Add the content
+    icon = "✔" if message_type == "success" else "✖"
+    canvas.create_text(150, 50, text=icon, font=("Arial", 24), fill=fg_color)
+    canvas.create_text(150, 90, text=message, font=("Arial", 12), fill=fg_color, width=260)
+    
+    # Center the message box
+    message_box.update_idletasks()
+    screen_width = message_box.winfo_screenwidth()
+    screen_height = message_box.winfo_screenheight()
+    x = (screen_width - message_box.winfo_width()) // 2
+    y = (screen_height - message_box.winfo_height()) // 2
+    message_box.geometry(f"+{x}+{y}")
+    
+    # Ensure the message box is focused
+    message_box.focus_force()
+    
+    # Schedule the message box to close after 5 seconds (5000 milliseconds)
+    message_box.after(time, message_box.destroy)
+
+if __name__ == "__main__":
+    os.system("python main.py")

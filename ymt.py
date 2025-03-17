@@ -36,7 +36,7 @@ CATEGORY_PREFIXES = {
     "under shirt": "accs",
     "vests": "task",
     "watches": "p_lwrist",
-    "glasses": "p_eyes",  # Fixed mapping for glasses
+    "glasses": "p_eyes",  # Ensure this mapping exists
     "hats": "p_head"  # Fixed mapping for hats
 }
 
